@@ -18,7 +18,7 @@ Guía para operar el bot: iniciarlo, detenerlo, reiniciarlo, entender qué pasa 
 | Permisos vigentes | Conservan su **vencimiento original** (no se renuevan). |
 | Permisos vencidos con el bot apagado | Se cierran y se vuelve a silenciar. |
 | Permisos de quien salió o cambió de canal | Se cancelan. |
-| Votaciones abiertas | **Se cancelan** y se avisa en el canal; pueden volver a usar `/pedir-palabra`. |
+| Votaciones abiertas (palabra, iniciar, vigilar, dejar de vigilar, finalizar) | **Se cancelan** y se avisa en el canal; hay que volver a solicitarlas. Ninguna acción administrativa se ejecuta por una votación interrumpida. |
 | Patrulla finalizada | No se reactiva. |
 
 ## Archivo de estado
@@ -44,7 +44,8 @@ Guía para operar el bot: iniciarlo, detenerlo, reiniciarlo, entender qué pasa 
 - **Falla el re-mute al vencer un permiso:** el permiso se cierra igual (nunca queda indefinido), se avisa y se reintenta.
 - **Falla la liberación al finalizar:** la patrulla igual queda finalizada; el silencio queda pendiente y se avisa para revisión manual.
 - **No se puede publicar en el canal de votaciones:** no se crea la solicitud y se informa; los demás anuncios fallan sin romper el estado.
-- **Se borra el mensaje de una votación:** la solicitud se cancela y se avisa.
+- **Se borra el mensaje de una votación:** la solicitud se cancela y se avisa. Es también la forma de descartar una votación pendiente que nadie vota (no vencen por tiempo).
+- **Una votación aprobada ya no es válida al ejecutarse** (la patrulla cambió, el usuario ya no está en el canal, etc.): se cancela con el motivo y no se ejecuta nada.
 - **Falla escribir en disco:** el comando falla con un mensaje genérico (el detalle va al log).
 - **Un moderador cambia mutes a mano:** el bot no pelea ni revierte sus cambios (ver [ARQUITECTURA.md](ARQUITECTURA.md)); un des-silencio manual se respeta hasta que la persona se reconecte.
 
@@ -61,7 +62,9 @@ Guía para operar el bot: iniciarlo, detenerlo, reiniciarlo, entender qué pasa 
 | "No pude publicar la votación" | El bot no ve o no puede escribir en `VOTING_CHANNEL_ID`. |
 | Un vigilado habla | ¿Bot apagado? ¿Un moderador lo des-silenció (`/policia-estado` lo indica)? ¿Estaba silenciado antes por un moderador? ¿Tiene un permiso vigente? |
 | Sigue silenciado tras finalizar | Estaba fuera de voz: se libera al conectarse. Si no, intervención manual. |
-| `/pedir-palabra` dice que no hay votantes | En su canal de voz solo hay bots y/o él mismo. |
+| Un comando de votación dice que no hay votantes | En el canal del afectado solo hay bots y/o él mismo; en `/policia-finalizar`, ningún vigilado está conectado o no hay humanos no vigilados con ellos. |
+| "no está conectado a un canal de voz" al usar `/policia-iniciar`, `/vigilar` o `/dejar-vigilar` | Esas votaciones exigen que el afectado esté en voz. |
+| "Ya hay una votación pendiente…" / "Hay una votación pendiente para finalizar…" | Hay una solicitud duplicada o contradictoria abierta. Esperá su resultado o borrá su mensaje para cancelarla. |
 | `/pedir-palabra` dice que está silenciado por un moderador | Por seguridad el bot no levanta por votación un silencio que no aplicó. |
 | Errores de `rename`/`EPERM` al guardar | Carpeta sincronizada (OneDrive, Dropbox): poné `DATA_DIR` fuera de ella. |
 
@@ -69,6 +72,7 @@ Guía para operar el bot: iniciarlo, detenerlo, reiniciarlo, entender qué pasa 
 
 - Una patrulla y un servidor a la vez; una única instancia del bot.
 - Las votaciones no vencen por tiempo y se cancelan en cada reinicio.
+- **Patrulla que no se puede finalizar:** `/policia-finalizar` y `/dejar-vigilar` necesitan votantes humanos conectados. Si todos los vigilados están solos en su canal o desconectados, no hay padrón y no se puede votar (nada se aprueba automáticamente). La patrulla sigue activa hasta que haya votantes; si hace falta cerrarla de urgencia, un moderador debe quitar a mano los mutes (ver "Recuperar silencios").
 - Las acciones se ejecutan en serie: con la API de Discord lenta se encolan.
 - Si se pierden eventos del gateway, el recuento de votos se resincroniza en el siguiente cambio de reacción (no hay relectura periódica).
 - Las pruebas funcionales completas en un servidor real siguen pendientes.

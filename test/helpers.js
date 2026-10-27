@@ -213,6 +213,12 @@ class FakeDiscord {
     return [...this.muteCalls].reverse().find((c) => c.userId === userId) ?? null;
   }
 
+  /** Último mensaje de votación de cualquier tipo (palabra o administrativa). */
+  lastVoteMessage(type) {
+    const marker = { START_PATROL: 'INICIAR PATRULLA', ADD_WATCH: 'VIGILAR USUARIO', REMOVE_WATCH: 'DEJAR DE VIGILAR', END_PATROL: 'FINALIZAR PATRULLA', SPEAK_PERMISSION: 'PERMISO PARA HABLAR' }[type];
+    return [...this.sent].reverse().find((m) => (marker ? m.content.includes(marker) : m.content.includes('Votantes habilitados'))) ?? null;
+  }
+
   /** Último mensaje de votación publicado (solicitud de palabra). */
   lastPollMessage() {
     return [...this.sent].reverse().find((m) => m.content.includes('PERMISO PARA HABLAR')) ?? null;

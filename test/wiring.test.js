@@ -23,7 +23,7 @@ function fakeService() {
     onVoiceStateUpdate: rec('voice'),
     onReactionChange: rec('reaction'),
     onMessageDeleted: rec('deleted'),
-    startPatrol: async (a) => (calls.push(['start', a]), { ok: true, mute: { status: 'muted' } }),
+    requestStartPatrol: async (a) => (calls.push(['start', a]), { ok: true, poll: { roster: ['x'] } }),
   };
 }
 
@@ -77,13 +77,13 @@ test('un slash command se difiere, se ejecuta y responde de forma efímera', asy
   await tick();
   await tick();
   assert.deepEqual(log[0], ['defer', { flags: MessageFlags.Ephemeral }]);
-  assert.match(log[1][1].content, /Patrulla iniciada/);
+  assert.match(log[1][1].content, /Votación para iniciar la patrulla/);
   assert.deepEqual(service.calls[0], ['start', { by: 'mod', targetId: 'u1', targetIsBot: false }]);
 });
 
 test('un error interno responde un mensaje genérico (sin filtrar detalles)', async () => {
   const client = new EventEmitter();
-  const service = { startPatrol: async () => { throw new Error('detalle interno secreto'); } };
+  const service = { requestStartPatrol: async () => { throw new Error('detalle interno secreto'); } };
   registerHandlers({ client, service, config, logger });
   const log = [];
   client.emit(Events.InteractionCreate, {

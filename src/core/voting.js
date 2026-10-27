@@ -3,21 +3,33 @@
 const YES = '✅';
 const NO = '❌';
 
+/** Tipos de votación. Todos comparten padrón fijo, reacciones, mayoría y persistencia. */
+const POLL_TYPES = Object.freeze({
+  SPEAK_PERMISSION: 'SPEAK_PERMISSION', // un vigilado pide hablar
+  START_PATROL: 'START_PATROL', // iniciar la patrulla vigilando a un usuario
+  ADD_WATCH: 'ADD_WATCH', // sumar un usuario a la patrulla activa
+  REMOVE_WATCH: 'REMOVE_WATCH', // dejar de vigilar a un usuario
+  END_PATROL: 'END_PATROL', // finalizar la patrulla completa
+});
+
 /** Mayoría simple estricta: floor(n/2) + 1. */
 function majority(voters) {
   return Math.floor(voters / 2) + 1;
 }
 
 /**
- * Padrón fijo: humanos presentes en el canal, sin repetidos, sin bots y sin el solicitante.
+ * Padrón fijo: humanos presentes, sin repetidos (una persona = un voto aunque aparezca en
+ * varios canales), sin bots y sin los ids excluidos (solicitante / afectado / vigilados).
  * @param {{id: string, bot?: boolean}[]} members
+ * @param {string | Iterable<string>} exclude  un id o varios
  * @returns {{ roster: string[], participants: number }}
- *   participants = humanos conectados (incluye al solicitante).
+ *   participants = humanos conectados (incluye a los excluidos que estén entre ellos).
  */
-function buildRoster(members, requesterId) {
+function buildRoster(members, exclude) {
+  const excluded = new Set(typeof exclude === 'string' ? [exclude] : (exclude ?? []));
   const humans = new Map();
   for (const m of members) if (!m.bot) humans.set(m.id, m);
-  const roster = [...humans.keys()].filter((id) => id !== requesterId);
+  const roster = [...humans.keys()].filter((id) => !excluded.has(id));
   return { roster, participants: humans.size };
 }
 
@@ -52,4 +64,4 @@ function decide(voters, needed, yes, no) {
   return 'open';
 }
 
-module.exports = { YES, NO, majority, buildRoster, tally, decide };
+module.exports = { YES, NO, POLL_TYPES, majority, buildRoster, tally, decide };

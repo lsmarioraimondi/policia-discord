@@ -16,7 +16,7 @@ const definitions = [
     level: 'admin',
     build: (b) =>
       b
-        .setDescription('Inicia una patrulla vigilando a un usuario')
+        .setDescription('Propone iniciar una patrulla vigilando a un usuario (se vota)')
         .addUserOption((o) => o.setName('usuario').setDescription('Primer usuario a vigilar').setRequired(true))
         .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   },
@@ -25,7 +25,7 @@ const definitions = [
     level: 'mod',
     build: (b) =>
       b
-        .setDescription('Agrega un usuario a la patrulla activa')
+        .setDescription('Propone vigilar a un usuario en la patrulla activa (se vota)')
         .addUserOption((o) => o.setName('usuario').setDescription('Usuario a vigilar').setRequired(true))
         .setDefaultMemberPermissions(PermissionFlagsBits.MuteMembers),
   },
@@ -34,7 +34,7 @@ const definitions = [
     level: 'mod',
     build: (b) =>
       b
-        .setDescription('Quita a un usuario de la patrulla')
+        .setDescription('Propone dejar de vigilar a un usuario (se vota)')
         .addUserOption((o) => o.setName('usuario').setDescription('Usuario a dejar de vigilar').setRequired(true))
         .setDefaultMemberPermissions(PermissionFlagsBits.MuteMembers),
   },
@@ -42,7 +42,7 @@ const definitions = [
     name: 'policia-finalizar',
     level: 'admin',
     build: (b) =>
-      b.setDescription('Finaliza la patrulla y deja de vigilar a todos').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+      b.setDescription('Propone finalizar la patrulla y dejar de vigilar a todos (se vota)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   },
   {
     name: 'policia-estado',

@@ -47,7 +47,7 @@ async function setup(voters, extra = {}) {
   const h = await createHarness(extra);
   await h.discord.join('req', 'v1');
   for (const v of voters) await h.discord.join(v, 'v1');
-  await h.service.startPatrol({ by: 'mod', targetId: 'req' });
+  await h.service.applyStartPatrol({ by: 'mod', targetId: 'req' });
   const res = await h.service.requestFloor({ userId: 'req' });
   return { h, res, msg: res.poll?.messageId };
 }
@@ -73,7 +73,7 @@ test('los bots y el solicitante no cuentan como votantes', async () => {
   await h.discord.join('req', 'v1');
   await h.discord.join('musicbot', 'v1');
   await h.discord.join('a', 'v1');
-  await h.service.startPatrol({ by: 'mod', targetId: 'req' });
+  await h.service.applyStartPatrol({ by: 'mod', targetId: 'req' });
   const res = await h.service.requestFloor({ userId: 'req' });
   assert.deepEqual(res.poll.roster, ['a']);
   assert.equal(res.poll.needed, 1);
@@ -162,8 +162,8 @@ test('usuarios externos al padrón no influyen (ni en contra ni a favor)', async
 test('votaciones simultáneas e independientes en el mismo canal', async () => {
   const h = await createHarness();
   for (const u of ['p1', 'p2', 'x', 'y']) await h.discord.join(u, 'v1');
-  await h.service.startPatrol({ by: 'mod', targetId: 'p1' });
-  await h.service.watch({ by: 'mod', targetId: 'p2' });
+  await h.service.applyStartPatrol({ by: 'mod', targetId: 'p1' });
+  await h.service.applyWatch({ by: 'mod', targetId: 'p2' });
   const [r1, r2] = await Promise.all([
     h.service.requestFloor({ userId: 'p1' }),
     h.service.requestFloor({ userId: 'p2' }),
@@ -198,10 +198,10 @@ test('condiciones de /pedir-palabra', async () => {
 
   await h.discord.join('u1', 'v1');
   await h.discord.join('a', 'v1');
-  await h.service.startPatrol({ by: 'mod', targetId: 'u1' });
+  await h.service.applyStartPatrol({ by: 'mod', targetId: 'u1' });
   assert.equal((await req('a')).code, 'NOT_WATCHED_SELF');
 
-  await h.service.watch({ by: 'mod', targetId: 'off' });
+  await h.service.applyWatch({ by: 'mod', targetId: 'off' });
   assert.equal((await req('off')).code, 'NOT_IN_VOICE');
 
   assert.equal((await req('u1')).ok, true);
@@ -239,7 +239,7 @@ test('si fallan las reacciones automáticas la votación igual queda abierta y s
   const h = await createHarness();
   await h.discord.join('req', 'v1');
   await h.discord.join('a', 'v1');
-  await h.service.startPatrol({ by: 'mod', targetId: 'req' });
+  await h.service.applyStartPatrol({ by: 'mod', targetId: 'req' });
   h.discord.failReactions = true;
   const res = await h.service.requestFloor({ userId: 'req' });
   assert.equal(res.ok, true);
@@ -250,7 +250,7 @@ test('si no se puede publicar la votación no se crea la solicitud', async () =>
   const h = await createHarness();
   await h.discord.join('req', 'v1');
   await h.discord.join('a', 'v1');
-  await h.service.startPatrol({ by: 'mod', targetId: 'req' });
+  await h.service.applyStartPatrol({ by: 'mod', targetId: 'req' });
   h.discord.failSend = true;
   const res = await h.service.requestFloor({ userId: 'req' });
   assert.equal(res.code, 'SEND_FAILED');
@@ -284,7 +284,7 @@ test('aprobación pero el solicitante ya no está en el canal original: no se co
 
 test('finalizar con votaciones abiertas las cancela', async () => {
   const { h, msg } = await setup(['a', 'b']);
-  await h.service.finalize({ by: 'mod' });
+  await h.service.applyFinalize({ by: 'mod' });
   assert.deepEqual(h.store.snapshot().polls, {});
   assert.match(h.discord.messages.get(msg).content, /CANCELADA/);
   await h.discord.vote(msg, 'a');

@@ -1,14 +1,22 @@
 'use strict';
 
 const { randomUUID } = require('node:crypto');
-const { YES, NO, majority, buildRoster, tally, decide } = require('./voting');
+const { YES, NO, POLL_TYPES, majority, buildRoster, tally, decide } = require('./voting');
 const { messages } = require('../messages');
 
+const ADMIN_TYPES = [POLL_TYPES.START_PATROL, POLL_TYPES.ADD_WATCH, POLL_TYPES.REMOVE_WATCH, POLL_TYPES.END_PATROL];
+
 /**
- * Votaciones de "pedir palabra". Cada votación es independiente: tiene su propio mensaje,
- * su padrón fijo y su registro de votos. Los votos se recalculan siempre desde las
- * reacciones reales del mensaje (idempotente: no hay conteos incrementales que puedan
- * desincronizarse ni votos duplicados).
+ * Votaciones (pedir palabra y decisiones administrativas). Todas comparten el mismo
+ * mecanismo: padrón fijo, mensaje con reacciones ✅/❌, mayoría `floor(n/2)+1` sobre el total
+ * de habilitados y recuento releído de las reacciones reales (idempotente: no hay conteos
+ * incrementales que puedan desincronizarse ni votos duplicados). Cada votación es
+ * independiente; lo que cambia entre tipos es solo el padrón y la acción al aprobarse
+ * (ver PoliciaService._approve).
+ *
+ * Campos de una votación: id, type, patrolId (null si aún no hay patrulla), requesterId
+ * (quien la solicitó), targetId (usuario afectado; null en END_PATROL), channelId /
+ * channelIds, messageId, roster, needed, votes, status, createdAt.
  */
 class VotingManager {
   constructor(ctx) {
@@ -19,8 +27,14 @@ class VotingManager {
     return Object.values(this.ctx.state.polls);
   }
 
+  /** Votación abierta de "pedir palabra" de un usuario. */
   openPollOf(userId) {
-    return this.open().find((p) => p.requesterId === userId) ?? null;
+    return this.open().find((p) => p.type === POLL_TYPES.SPEAK_PERMISSION && p.targetId === userId) ?? null;
+  }
+
+  /** Votaciones administrativas abiertas (opcionalmente filtradas por tipo/afectado). */
+  openAdmin({ types = ADMIN_TYPES, targetId } = {}) {
+    return this.open().filter((p) => types.includes(p.type) && (targetId === undefined || p.targetId === targetId));
   }
 
   byMessage(messageId) {
@@ -29,26 +43,30 @@ class VotingManager {
 
   /**
    * Crea la votación: arma el padrón, publica el mensaje y persiste.
+   * @param {object} spec
+   * @param {string} spec.type          uno de POLL_TYPES
+   * @param {string} spec.requesterId   quien la solicita
+   * @param {string|null} spec.targetId usuario afectado (null en END_PATROL)
+   * @param {string[]} spec.channelIds  canales de voz de los que sale el padrón
+   * @param {{id:string,bot?:boolean}[]} spec.members  humanos/bots presentes en esos canales
+   * @param {Iterable<string>} spec.exclude  ids que no votan (afectado, solicitante, vigilados)
+   * @param {string[]} [spec.watchedIds]  solo END_PATROL: vigilados al momento de la solicitud
    * @returns {Promise<{ ok: true, poll, reactionsFailed: boolean } | { ok: false, code: string }>}
    */
-  async create(userId, voiceChannelId) {
+  async create(spec) {
     const { state, config, discord, logger } = this.ctx;
-
-    let members;
-    try {
-      members = await discord.getVoiceChannelMembers(voiceChannelId);
-    } catch (err) {
-      logger.warn(`No se pudo leer el canal de voz ${voiceChannelId}: ${err.message}`);
-      return { ok: false, code: 'INTERNAL' };
-    }
-    const { roster, participants } = buildRoster(members, userId);
-    if (roster.length === 0) return { ok: false, code: 'NO_VOTERS' };
+    const { roster, participants } = buildRoster(spec.members, spec.exclude);
+    if (roster.length === 0) return { ok: false, code: 'NO_VOTERS' }; // nunca se aprueba sin votantes
 
     const poll = {
       id: randomUUID(),
-      patrolId: state.patrol.id,
-      requesterId: userId,
-      channelId: voiceChannelId,
+      type: spec.type,
+      patrolId: state.patrol?.id ?? null,
+      requesterId: spec.requesterId,
+      targetId: spec.targetId ?? null,
+      channelId: spec.channelIds[0] ?? null,
+      channelIds: spec.channelIds,
+      watchedIds: spec.watchedIds ?? [],
       messageId: null,
       messageChannelId: config.votingChannelId,
       roster,
@@ -119,12 +137,12 @@ class VotingManager {
     }
   }
 
-  /** Quita una votación y actualiza su mensaje con el resultado. */
+  /** Quita una votación del estado (persistiendo) y, si se da texto, actualiza su mensaje. */
   async close(poll, text) {
     delete this.ctx.state.polls[poll.id];
     await this.ctx.save();
-    await this.ctx.safeEdit(poll.messageChannelId, poll.messageId, text);
+    if (text) await this.ctx.safeEdit(poll.messageChannelId, poll.messageId, text);
   }
 }
 
-module.exports = { VotingManager };
+module.exports = { VotingManager, ADMIN_TYPES };

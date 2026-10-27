@@ -13,7 +13,7 @@ async function withPermit() {
   const h = await createHarness();
   await h.discord.join('req', 'v1');
   await h.discord.join('a', 'v1');
-  await h.service.startPatrol({ by: 'mod', targetId: 'req' });
+  await h.service.applyStartPatrol({ by: 'mod', targetId: 'req' });
   const r = await h.service.requestFloor({ userId: 'req' });
   await h.discord.vote(r.poll.messageId, 'a');
   return { h, msg: r.poll.messageId };
@@ -22,8 +22,8 @@ async function withPermit() {
 test('recupera la patrulla, los vigilados y re-silencia a los conectados', async () => {
   const h = await createHarness();
   await h.discord.join('u1', 'v1');
-  await h.service.startPatrol({ by: 'mod', targetId: 'u1' });
-  await h.service.watch({ by: 'mod', targetId: 'u2' }); // desconectado
+  await h.service.applyStartPatrol({ by: 'mod', targetId: 'u1' });
+  await h.service.applyWatch({ by: 'mod', targetId: 'u2' }); // desconectado
 
   // durante el reinicio, u2 entró y el mute de u1 se perdió
   h.discord.voice.get('u1').serverMute = false;
@@ -80,7 +80,7 @@ test('votaciones interrumpidas por un reinicio se cancelan y se comunica', async
   const h = await createHarness();
   await h.discord.join('req', 'v1');
   for (const v of ['a', 'b', 'c']) await h.discord.join(v, 'v1');
-  await h.service.startPatrol({ by: 'mod', targetId: 'req' });
+  await h.service.applyStartPatrol({ by: 'mod', targetId: 'req' });
   const r = await h.service.requestFloor({ userId: 'req' });
   await h.discord.vote(r.poll.messageId, 'a', false); // sigue abierta (3 votantes, 2 necesarios)
   assert.equal(Object.keys(h.store.snapshot().polls).length, 1);
@@ -97,8 +97,8 @@ test('votaciones interrumpidas por un reinicio se cancelan y se comunica', async
 test('una patrulla finalizada no se reactiva tras reiniciar', async () => {
   const h = await createHarness();
   await h.discord.join('u1', 'v1');
-  await h.service.startPatrol({ by: 'mod', targetId: 'u1' });
-  await h.service.finalize({ by: 'mod' });
+  await h.service.applyStartPatrol({ by: 'mod', targetId: 'u1' });
+  await h.service.applyFinalize({ by: 'mod' });
 
   await h.restart();
   await h.service.recover();
@@ -114,9 +114,9 @@ test('finalización interrumpida: la patrulla ya figura finalizada y los mutes p
   const { DiscordOpError } = require('../src/core/errors');
   const h = await createHarness();
   await h.discord.join('u1', 'v1');
-  await h.service.startPatrol({ by: 'mod', targetId: 'u1' });
+  await h.service.applyStartPatrol({ by: 'mod', targetId: 'u1' });
   h.discord.failMute = new DiscordOpError('UNKNOWN', 'el proceso murió aquí'); // la liberación no llega a ejecutarse
-  await h.service.finalize({ by: 'mod' });
+  await h.service.applyFinalize({ by: 'mod' });
   const saved = h.store.snapshot();
   assert.equal(saved.patrol, null);
   assert.ok(saved.pendingReleases.u1);
@@ -199,7 +199,7 @@ test('el servicio funciona de punta a punta sobre JsonStore real (reinicio inclu
   try {
     const h = await createHarness({ store: new JsonStore(dir) });
     await h.discord.join('u1', 'v1');
-    await h.service.startPatrol({ by: 'mod', targetId: 'u1' });
+    await h.service.applyStartPatrol({ by: 'mod', targetId: 'u1' });
     await h.restart();
     await h.service.recover();
     const st = await h.service.getStatus();

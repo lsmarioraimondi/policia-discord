@@ -1,13 +1,13 @@
 # 🚔 Policía Discord
 
-Bot de Discord que funciona como un **policía de voz por patrullas**: un administrador inicia una patrulla, los usuarios vigilados quedan con *server mute* y solo pueden hablar si **los demás integrantes de su canal de voz lo aprueban por votación**.
+Bot de Discord que funciona como un **policía de voz por patrullas**: una patrulla se inicia, se modifica y se termina **por votación**; los usuarios vigilados quedan con *server mute* y solo pueden hablar si **los demás integrantes de su canal de voz lo aprueban por votación**.
 
 - Sin patrulla activa, el bot **no vigila ni silencia a nadie**.
-- La patrulla la inicia un administrador con `@usuario`; se pueden sumar más vigilados y termina solo cuando un administrador la finaliza.
+- Un administrador *propone* iniciar la patrulla con `@usuario`; los usuarios conectados al mismo canal votan con ✅/❌. Lo mismo ocurre para sumar vigilados, dejar de vigilar y finalizar la patrulla: **nada cambia hasta que la votación se aprueba**.
 - Un vigilado pide la palabra con `/pedir-palabra`; si la mayoría vota a favor obtiene **120 segundos** (configurable) para hablar.
 - Al finalizar, el bot libera únicamente los silencios que **él** aplicó. No pisa los de los moderadores.
 
-> **Estado de las pruebas:** hay 98 tests automatizados con Discord simulado. El registro de comandos y la conexión a Discord ya fueron verificados; **las pruebas funcionales completas en un servidor real siguen pendientes**. Hasta entonces, considerá el bot como no probado en producción.
+> **Estado de las pruebas:** hay 140 tests automatizados con Discord simulado. El registro de comandos y la conexión a Discord ya fueron verificados; **las pruebas funcionales completas en un servidor real siguen pendientes**. Hasta entonces, considerá el bot como no probado en producción.
 
 ## Requisitos
 
@@ -54,21 +54,23 @@ Ese entero equivale a **Ver canales, Enviar mensajes, Añadir reacciones, Leer h
 
 ## Comandos
 
-| Comando | Quién puede usarlo | Qué hace |
-|---|---|---|
-| `/policia-iniciar usuario:@U` | `Gestionar servidor` | Inicia la patrulla con `@U` como primer vigilado. |
-| `/vigilar usuario:@U` | `Silenciar miembros` o `Gestionar servidor` | Suma a `@U` a la patrulla activa. |
-| `/dejar-vigilar usuario:@U` | idem | Quita a `@U`: cancela su votación/permiso y libera su silencio si era del bot. |
-| `/policia-finalizar` | `Gestionar servidor` | Termina la patrulla y libera lo que sea seguro liberar. |
-| `/policia-estado` | `Silenciar miembros` o `Gestionar servidor` | Vigilados, canales, mutes, votaciones y permisos (respuesta privada). |
-| `/pedir-palabra` | cualquier vigilado en voz | Abre una votación. |
+Quien ejecuta un comando administrativo solo **publica una votación** en `VOTING_CHANNEL_ID`. La acción se ejecuta únicamente si la votación se aprueba.
 
-Las respuestas a quien ejecuta son privadas; los anuncios y las votaciones se publican en `VOTING_CHANNEL_ID` sin notificar (sin ping).
+| Comando | Quién puede solicitarlo | Votación (tipo) y padrón |
+|---|---|---|
+| `/policia-iniciar usuario:@U` | `Gestionar servidor` | `START_PATROL`: humanos del canal de voz de `@U`, sin `@U` ni bots. Si se aprueba: inicia la patrulla, vigila a `@U` y lo silencia. |
+| `/vigilar usuario:@U` | `Silenciar miembros` o `Gestionar servidor` | `ADD_WATCH`: igual que arriba. Si se aprueba, `@U` se incorpora. |
+| `/dejar-vigilar usuario:@U` | idem | `REMOVE_WATCH`: igual. Si se aprueba, deja de vigilarse y se libera su silencio **solo si era del bot**; si se rechaza, sigue vigilado. |
+| `/policia-finalizar` | `Gestionar servidor` | `END_PATROL`: unión de los humanos **no vigilados** que comparten canal con algún vigilado (cada persona vota una vez). Si se aprueba: finalización completa. |
+| `/policia-estado` | `Silenciar miembros` o `Gestionar servidor` | Sin votación. Vigilados, canales, mutes, votaciones pendientes (con su tipo) y permisos (respuesta privada). |
+| `/pedir-palabra` | cualquier vigilado en voz | `SPEAK_PERMISSION`: canal del solicitante, sin él ni bots. Si se aprueba: 120 s para hablar. |
+
+Los anuncios y las votaciones se publican sin notificar (sin ping); las respuestas a quien ejecuta son privadas. Si cambiás las descripciones de los comandos, volvé a ejecutar `npm run register`.
 
 ## Ejemplo de uso
 
-1. `/policia-iniciar usuario:@Lucas` → Lucas queda silenciado (o se lo silenciará al entrar a voz). La patrulla no termina sola, ni siquiera si Lucas se va del canal.
-2. `/vigilar usuario:@Ana` → Ana se suma sin alterar votaciones ni permisos ajenos.
+1. `/policia-iniciar usuario:@Lucas` (Lucas debe estar en voz con otras personas) → se publica la votación; al alcanzar la mayoría se inicia la patrulla y Lucas queda silenciado. La patrulla no termina sola, ni siquiera si Lucas se va del canal.
+2. `/vigilar usuario:@Ana` → otra votación entre quienes están con Ana; recién al aprobarse Ana se suma, sin alterar votaciones ni permisos ajenos.
 3. Lucas ejecuta `/pedir-palabra` y el bot publica:
 
 ```
@@ -84,22 +86,25 @@ Las respuestas a quien ejecuta son privadas; los anuncios y las votaciones se pu
 ```
 
 4. Al llegar a 3 votos ✅ el bot lo des-silencia al instante; a los 2 minutos vuelve a silenciarlo.
-5. `/policia-finalizar` termina la patrulla; desde ahí el bot no silencia a nadie.
+5. `/policia-finalizar` → votación `END_PATROL`; si se aprueba, la patrulla termina y desde ahí el bot no silencia a nadie.
 
 ### Reglas de votación
 
-- Votan solo quienes estaban en el **mismo canal de voz al crear la solicitud** (padrón fijo), sin el solicitante ni bots.
-- Mayoría `floor(votantes / 2) + 1`: se aprueba al instante al alcanzarla y se rechaza cuando ya es imposible alcanzarla.
+- Votan solo quienes estaban en el padrón **al crear la solicitud** (padrón fijo; ver la tabla de comandos). Nunca votan el afectado/solicitante ni los bots.
+- Mayoría `floor(votantes / 2) + 1` **sobre el total de habilitados, no sobre quienes votaron**: se aprueba al instante al alcanzarla y se rechaza cuando ya es imposible alcanzarla.
 - Un voto por persona, que puede cambiar o retirar. **Reaccionar con ✅ y ❌ a la vez cuenta como ❌.**
-- Sin votantes habilitados no se inicia la votación ni se concede nada. Las votaciones no vencen por tiempo.
-- Salir o cambiar de canal, dejar de ser vigilado, borrar el mensaje, finalizar la patrulla o reiniciar el bot cancelan la votación/permiso.
+- Sin votantes habilitados no se inicia la votación ni se aprueba nada. Las votaciones no vencen por tiempo.
+- Las votaciones sobre un usuario (iniciar/vigilar/dejar de vigilar) exigen que esté **conectado a voz**.
+- Se rechazan las solicitudes duplicadas o contradictorias: una sola `START_PATROL`; una sola `ADD/REMOVE_WATCH` por usuario; `END_PATROL` no coexiste con `ADD/REMOVE_WATCH` pendientes. Las de palabra coexisten con todas. Para cancelar una votación pendiente, borrá su mensaje.
+- Salir o cambiar de canal el usuario afectado, dejar de ser vigilado, borrar el mensaje, finalizar la patrulla o reiniciar el bot cancelan la votación (y el permiso).
 
 ## Seguridad y limitaciones conocidas
 
 - Discord **no informa quién aplicó un mute**: el bot solo libera los que él observó y recordó. Si un moderador silencia a mano a alguien que el bot ya había silenciado, el bot no puede notarlo.
 - Un vigilado **ya silenciado por un moderador** no se des-silencia nunca y no puede pedir palabra.
 - Discord **no permite cambiar el mute de alguien que no está en voz**: esos silencios quedan como *liberaciones pendientes* hasta que la persona se conecte (se descartan a los 7 días con una advertencia).
-- Detener el proceso **no finaliza la patrulla**; con el bot apagado nadie se vigila. Las votaciones abiertas se cancelan en cada reinicio.
+- Detener el proceso **no finaliza la patrulla**; con el bot apagado nadie se vigila. Las votaciones abiertas (de cualquier tipo) se cancelan en cada reinicio.
+- Como finalizar o dejar de vigilar exige votantes conectados, **una patrulla cuyos vigilados están solos o desconectados no puede finalizarse hasta que haya votantes** (ver [OPERACION.md](docs/OPERACION.md)).
 - Una sola patrulla y un solo servidor a la vez; debe correr **una única instancia** del bot.
 - Mantené `DISCORD_TOKEN` fuera del repositorio; si se expone, regeneralo (*Reset Token*).
 

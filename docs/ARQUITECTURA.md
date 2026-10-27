@@ -12,8 +12,8 @@ src/
   core/                    lógica del bot, sin dependencia directa de discord.js
     service.js             fachada con mutex: patrullas, vigilados, votos, permisos, voz, recuperación
     muteManager.js         propiedad de mutes, eventos propios vs. externos, liberación
-    votingManager.js       votaciones (crear, releer reacciones, cancelar, cerrar)
-    voting.js              reglas puras: mayoría, padrón, recuento, decisión
+    votingManager.js       votaciones de todos los tipos (crear, releer reacciones, cancelar, cerrar)
+    voting.js              reglas puras: tipos, mayoría, padrón, recuento, decisión
     permitManager.js       permisos temporales y sus temporizadores
     mutex.js  context.js  errors.js
   discord/                 adaptadores finos sobre discord.js
@@ -23,7 +23,7 @@ src/
     handlers.js            eventos de discord.js -> núcleo
   storage/
     jsonStore.js  state.js persistencia atómica y lock de proceso
-test/                      98 tests (node:test) con Discord y reloj simulados
+test/                      140 tests (node:test) con Discord y reloj simulados
 ```
 
 El núcleo (`src/core`) solo conoce una interfaz `discord` (`getVoiceState`, `setMute`, `sendMessage`, `fetchReactionUsers`, etc.) y un reloj inyectable. Por eso los tests reemplazan Discord y el tiempo por simulaciones y nunca operan sobre usuarios reales.
@@ -71,11 +71,44 @@ Al dejar de vigilar a alguien o finalizar, si el mute era propio se registra en 
 
 ## Votaciones
 
-- El padrón se calcula al crear la solicitud: humanos del canal sin solicitante ni bots, sin repetidos; queda **fijo**.
-- Cada cambio de reacción relee las listas de usuarios de ✅ y ❌ del mensaje y **recalcula** el recuento desde cero (idempotente; sin conteos incrementales que se desincronicen). Costo: 2 llamadas REST por evento de reacción.
-- Reacción doble ✅+❌ → ❌ (determinista). Se ignoran externos al padrón y al propio bot.
-- Aprobada: se verifica que la patrulla siga activa, que el usuario siga vigilado y en el canal original, se hace *unmute*, se confirma que Discord lo aceptó y recién entonces se crea el permiso. Si Discord lo rechaza, no hay permiso.
-- Cada votación tiene id único, patrulla, solicitante, canal de voz, mensaje, padrón, votos, umbral, estado y fecha. Nunca se mezclan votos entre solicitudes.
+Todas las decisiones relevantes pasan por **un único mecanismo de votación** (`votingManager.js` + `voting.js`); lo que cambia entre tipos es solo el padrón y la acción que se ejecuta al aprobarse (`PoliciaService._approve`).
+
+| Tipo | La solicita | Padrón (congelado al crear) | Al aprobarse |
+|---|---|---|---|
+| `SPEAK_PERMISSION` | un vigilado (`/pedir-palabra`) | humanos de su canal, sin él | unmute + permiso temporal |
+| `START_PATROL` | `/policia-iniciar` | humanos del canal del afectado, sin él | crea la patrulla y vigila al afectado |
+| `ADD_WATCH` | `/vigilar` | ídem | incorpora al afectado |
+| `REMOVE_WATCH` | `/dejar-vigilar` | ídem | quita al afectado (libera su mute si es propio) |
+| `END_PATROL` | `/policia-finalizar` | unión de humanos **no vigilados** presentes en los canales de los vigilados | finalización completa |
+
+- Una votación guarda: `id`, `type`, `patrolId` (`null` en `START_PATROL`), `requesterId` (quien la pidió), `targetId` (afectado; `null` en `END_PATROL`), `channelId`/`channelIds`, `messageId`, `roster`, `needed`, `votes`, `status`, `createdAt`.
+- **Padrón:** humanos presentes, sin repetidos (una persona = un voto aunque se vea desde varios vigilados), sin bots y sin los excluidos (afectado/solicitante; en `END_PATROL`, los vigilados). Queda **fijo**. Sin votantes no se crea la votación: nunca se aprueba nada automáticamente.
+- **Mayoría** `floor(n/2)+1` sobre el **total de habilitados**. Se aprueba al instante al alcanzarla y se rechaza cuando los votos en contra la vuelven imposible.
+- Cada cambio de reacción relee las listas de usuarios de ✅ y ❌ del mensaje y **recalcula** el recuento desde cero (idempotente; sin conteos incrementales que se desincronicen). Costo: 2 llamadas REST por evento de reacción. Reacción doble ✅+❌ → ❌. Se ignoran externos al padrón y al propio bot.
+- Nunca se mezclan votos entre solicitudes.
+
+### Acciones inmediatas vs. solicitudes
+
+El servicio separa dos capas. Las acciones inmediatas (`applyStartPatrol`, `applyWatch`, `applyUnwatch`, `applyFinalize`, implementadas por `_startPatrol`, `_watch`, `_unwatch`, `_finalize`) conservan la lógica original, incluida la propiedad de mutes. Los comandos **no** las llaman: usan las solicitudes (`requestStartPatrol`, `requestWatch`, `requestUnwatch`, `requestEndPatrol`, `requestFloor`), que solo validan y publican la votación. La acción se ejecuta recién en `_approveAdmin`, que antes **revalida** las condiciones (patrulla vigente, usuario aún en el canal de la votación, no vigilado/vigilado según corresponda) y **cierra la votación antes de actuar** (así la finalización, que cancela todas las votaciones, no cancela la que la aprobó). Si la revalidación falla, la votación se cancela con el motivo y no se ejecuta nada.
+
+### Solicitudes contradictorias o duplicadas
+
+Se rechazan al crearlas (`POLL_PENDING`, `END_PENDING`, `ADMIN_POLLS_PENDING`):
+
+- una sola `START_PATROL` pendiente (y ninguna si ya hay patrulla);
+- una sola `ADD_WATCH`/`REMOVE_WATCH` pendiente por usuario;
+- `END_PATROL` no coexiste con otra `END_PATROL` ni con `ADD_WATCH`/`REMOVE_WATCH` pendientes (en ningún orden);
+- `SPEAK_PERMISSION` coexiste con todas: si una `REMOVE_WATCH` o `END_PATROL` se aprueba, cancela las votaciones y permisos de palabra afectados.
+
+Como las votaciones no vencen, la forma de descartar una pendiente es **borrar su mensaje** (se cancela y se puede volver a solicitar).
+
+### Cancelación segura
+
+Una votación sobre un usuario (`SPEAK_PERMISSION`, `START_PATROL`, `ADD_WATCH`, `REMOVE_WATCH`) se cancela si el afectado **sale o cambia de canal** (incluso antes de estar vigilado), si deja de estar vigilado, si se borra su mensaje, si la patrulla finaliza o si el bot se reinicia. `END_PATROL` no depende de un usuario: su padrón queda congelado aunque un vigilado cambie de canal, y se cancela por borrado del mensaje, reinicio o fin de patrulla. Votos tardíos sobre una votación cancelada no tienen efecto.
+
+### Permiso de palabra
+
+Aprobada una `SPEAK_PERMISSION`: se verifica que la patrulla siga activa, que el usuario siga vigilado y en el canal original, se hace *unmute*, se confirma que Discord lo aceptó y recién entonces se crea el permiso. Si Discord lo rechaza, no hay permiso.
 
 ## Permisos temporales
 
@@ -94,7 +127,7 @@ Se guardan con `expiresAt` **absoluto**, nunca como tiempo restante, de modo que
 
 Con Discord listo, `service.start()` ejecuta (dentro del mutex):
 
-1. Cancela las votaciones abiertas (sus reacciones pudieron perderse) y lo avisa en el canal.
+1. Cancela **todas** las votaciones abiertas, de cualquier tipo (sus reacciones pudieron perderse) y lo avisa en el canal. Los estados guardados antes de existir los tipos se migran como `SPEAK_PERMISSION`.
 2. Resuelve operaciones de mute a medias observando el estado real.
 3. Permisos: conserva su vencimiento original; cierra y re-silencia los vencidos; cancela los de quien cambió de canal o salió con el bot apagado; reprograma los vigentes.
 4. Revisa a los vigilados conectados (re-silencia a quien corresponda) e intenta las liberaciones pendientes.
@@ -103,7 +136,7 @@ Con Discord listo, `service.start()` ejecuta (dentro del mutex):
 ## Seguridad y permisos
 
 - Privilegios mínimos: el bot pide solo *Ver canales, Enviar mensajes, Añadir reacciones, Leer historial y Silenciar miembros*. No usa Administrador, self-bots ni *Message Content Intent*.
-- Permisos de comandos (verificación en tiempo de ejecución autoritativa; los permisos por defecto solo ocultan comandos en la interfaz): `iniciar`/`finalizar` → `ManageGuild`; `vigilar`/`dejar-vigilar`/`estado` → `MuteMembers` o `ManageGuild`; `pedir-palabra` → cualquiera, pero el núcleo exige que esté vigilado. Quien tenga Administrador pasa todos los niveles.
+- Permisos de comandos (verificación en tiempo de ejecución autoritativa; los permisos por defecto solo ocultan comandos en la interfaz): `iniciar`/`finalizar` → `ManageGuild`; `vigilar`/`dejar-vigilar`/`estado` → `MuteMembers` o `ManageGuild`; `pedir-palabra` → cualquiera, pero el núcleo exige que esté vigilado. Los permisos de comando controlan quién puede **solicitar** una votación; votar puede hacerlo cualquiera que esté en el padrón. Quien tenga Administrador pasa todos los niveles.
 - Solo opera en `GUILD_ID`. Se rechaza vigilar bots y usuarios que no sean miembros.
 - Mensajes con `allowedMentions: { parse: [] }` (menciones sin ping). El logger redacta el token.
 - Los errores internos se informan al usuario con un mensaje genérico; el detalle va solo al log.

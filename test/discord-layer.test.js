@@ -21,19 +21,26 @@ const run = (h, name, permissions, extra = {}) =>
 
 test('permisos: iniciar/finalizar exigen ManageGuild; vigilar/estado aceptan MuteMembers', async () => {
   const h = await createHarness();
+  for (const u of ['u1', 'u2', 'a']) await h.discord.join(u, 'v1');
   assert.match(await run(h, 'policia-iniciar', MOD, { target: target() }), /No tenés permisos/);
   assert.match(await run(h, 'policia-iniciar', NONE, { target: target() }), /No tenés permisos/);
   assert.match(await run(h, 'policia-iniciar', null, { target: target() }), /No tenés permisos/);
-  assert.match(await run(h, 'policia-iniciar', ADMIN, { target: target() }), /Patrulla iniciada/);
+  assert.equal(h.store.snapshot().polls && Object.keys(h.store.snapshot().polls).length, 0, 'un rechazo no publica nada');
+
+  assert.match(await run(h, 'policia-iniciar', ADMIN, { target: target() }), /Votación para iniciar la patrulla/);
+  assert.equal(h.store.snapshot().patrol, null, 'el comando solo publica la votación');
+  await h.discord.vote(h.discord.lastVoteMessage('START_PATROL').id, 'a'); // 2 habilitados (a, u2): hace falta 2
+  await h.discord.vote(h.discord.lastVoteMessage('START_PATROL').id, 'u2');
+  assert.ok(h.store.snapshot().patrol, 'se aprobó: recién ahí empieza la patrulla');
 
   assert.match(await run(h, 'vigilar', NONE, { target: target('u2') }), /No tenés permisos/);
-  assert.match(await run(h, 'vigilar', MOD, { target: target('u2') }), /agregado/);
-  assert.match(await run(h, 'dejar-vigilar', NONE, { target: target('u2') }), /No tenés permisos/);
+  assert.match(await run(h, 'vigilar', MOD, { target: target('u2') }), /Votación para vigilar/);
+  assert.match(await run(h, 'dejar-vigilar', NONE, { target: target('u1') }), /No tenés permisos/);
+  assert.match(await run(h, 'dejar-vigilar', MOD, { target: target('u1') }), /Votación para dejar de vigilar/);
   assert.match(await run(h, 'policia-estado', NONE), /No tenés permisos/);
   assert.match(await run(h, 'policia-estado', MOD), /Patrulla activa/);
   assert.match(await run(h, 'policia-finalizar', MOD), /No tenés permisos/);
-  assert.match(await run(h, 'policia-finalizar', ADMIN), /Patrulla finalizada/);
-  assert.equal(h.store.snapshot().patrol, null);
+  assert.equal(h.store.snapshot().patrol !== null, true);
 });
 
 test('los comandos no ejecutan nada en un servidor distinto al configurado', async () => {
@@ -51,6 +58,7 @@ test('no se vigila a bots ni a usuarios que no están en el servidor', async () 
   const h = await createHarness();
   assert.match(await run(h, 'policia-iniciar', ADMIN, { target: target('x', { isMember: false }) }), /no es miembro/);
   assert.match(await run(h, 'policia-iniciar', ADMIN, { target: target('b', { bot: true }) }), /bot/);
+  assert.match(await run(h, 'policia-iniciar', ADMIN, { target: target('off') }), /no está conectado/);
   assert.equal(h.store.snapshot().patrol, null);
 });
 
@@ -58,7 +66,7 @@ test('respuestas claras cuando no se cumplen las condiciones de /pedir-palabra',
   const h = await createHarness();
   assert.match(await run(h, 'pedir-palabra', NONE), /No hay una patrulla activa/);
   await h.discord.join('u1', 'v1');
-  await run(h, 'policia-iniciar', ADMIN, { target: target('u1') });
+  await h.service.applyStartPatrol({ by: 'mod', targetId: 'u1' });
   assert.match(await run(h, 'pedir-palabra', NONE), /No estás siendo vigilado/);
   const asU1 = (n) => runCommand({ name: n, guildId: 'G', userId: 'u1', permissions: NONE }, h.service, h.config);
   assert.match(await asU1('pedir-palabra'), /No hay votantes habilitados/);
@@ -68,7 +76,7 @@ test('/pedir-palabra desde un vigilado con votantes publica la solicitud', async
   const h = await createHarness();
   await h.discord.join('u1', 'v1');
   await h.discord.join('a', 'v1');
-  await run(h, 'policia-iniciar', ADMIN, { target: target('u1') });
+  await h.service.applyStartPatrol({ by: 'mod', targetId: 'u1' });
   const out = await runCommand({ name: 'pedir-palabra', guildId: 'G', userId: 'u1', permissions: NONE }, h.service, h.config);
   assert.match(out, /Solicitud publicada/);
   assert.match(
