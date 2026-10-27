@@ -1,0 +1,28 @@
+{
+  "name": "policia-discord",
+  "version": "1.0.0",
+  "description": "Bot de Discord que inicia y termina patrullas de silenciamiento por voz con votación para hablar.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "register": "node src/register-commands.js",
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lsmarioraimondi/policia-discord.git"
+  },
+  "license": "ISC",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "bugs": {
+    "url": "https://github.com/lsmarioraimondi/policia-discord/issues"
+  },
+  "homepage": "https://github.com/lsmarioraimondi/policia-discord#readme",
+  "dependencies": {
+    "discord.js": "^14.27.0",
+    "dotenv": "^18.0.9"
+  }
+}
