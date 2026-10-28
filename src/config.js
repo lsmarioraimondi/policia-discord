@@ -2,6 +2,9 @@
 
 const SNOWFLAKE = /^\d{17,20}$/;
 
+/** Reconexiones completas (salida + regreso) durante un castigo que disparan el aislamiento. */
+const ISOLATION_RECONNECT_LIMIT = 2;
+
 function parseSnowflake(env, name, errors) {
   const value = (env[name] ?? '').trim();
   if (!SNOWFLAKE.test(value)) {
@@ -36,6 +39,24 @@ function loadConfig(env, opts = {}) {
     }
   }
 
+  const intVar = (name, def, min, max) => {
+    const raw = (env[name] ?? '').trim();
+    if (raw === '') return def;
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < min || n > max) {
+      errors.push(`${name} debe ser un entero entre ${min} y ${max}.`);
+      return def;
+    }
+    return n;
+  };
+  // Castigos temporales: duración inicial, tope de la duración exponencial y aislamiento (timeout de Discord).
+  const basePunishmentSeconds = intVar('BASE_PUNISHMENT_SECONDS', 120, 5, 2_592_000);
+  const maxPunishmentSeconds = intVar('MAX_PUNISHMENT_SECONDS', 86_400, 5, 2_592_000);
+  if (maxPunishmentSeconds < basePunishmentSeconds) {
+    errors.push('MAX_PUNISHMENT_SECONDS no puede ser menor que BASE_PUNISHMENT_SECONDS.');
+  }
+  const isolationDurationSeconds = intVar('ISOLATION_DURATION_SECONDS', 300, 10, 2_419_200); // Discord: máx. 28 días
+
   const logLevel = (env.LOG_LEVEL ?? 'info').trim().toLowerCase();
   if (!['debug', 'info', 'warn', 'error'].includes(logLevel)) {
     errors.push('LOG_LEVEL debe ser debug, info, warn o error.');
@@ -53,9 +74,13 @@ function loadConfig(env, opts = {}) {
     guildId,
     votingChannelId,
     speakDurationSeconds,
+    basePunishmentSeconds,
+    maxPunishmentSeconds,
+    isolationDurationSeconds,
+    isolationReconnectLimit: ISOLATION_RECONNECT_LIMIT,
     dataDir: (env.DATA_DIR ?? '').trim() || './data',
     logLevel,
   };
 }
 
-module.exports = { loadConfig };
+module.exports = { loadConfig, ISOLATION_RECONNECT_LIMIT };

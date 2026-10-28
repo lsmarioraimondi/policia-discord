@@ -10,7 +10,7 @@ async function setup(voters = ['a'], opts = {}) {
   const h = await createHarness(opts);
   await h.discord.join('req', 'v1');
   for (const v of voters) await h.discord.join(v, 'v1');
-  await h.service.applyStartPatrol({ by: 'mod', targetId: 'req' });
+  await h.service.applyWatch({ by: 'mod', targetId: 'req' });
   const res = await h.service.requestFloor({ userId: 'req' });
   return { h, poll: res.poll, msg: res.poll.messageId, voters };
 }
@@ -65,13 +65,13 @@ test('Discord rechaza el desmuteo: no hay permiso y se informa el error', async 
   assert.match(h.discord.messages.get(msg).content, /NO CONCEDIDO/);
   assert.match(h.discord.messages.get(msg).content, /permiso para silenciar/);
   assert.equal(h.discord.getVoiceState('req').serverMute, true);
-  assert.equal(h.store.snapshot().patrol.watched.req.botMuted, true, 'el mute sigue siendo del bot');
+  assert.equal(h.snapWatch('req').botMuted, true, 'el mute sigue siendo del bot');
 });
 
 test('permisos de distintos usuarios son independientes', async () => {
   const h = await createHarness();
   for (const u of ['p1', 'p2', 'x']) await h.discord.join(u, 'v1');
-  await h.service.applyStartPatrol({ by: 'mod', targetId: 'p1' });
+  await h.service.applyWatch({ by: 'mod', targetId: 'p1' });
   await h.service.applyWatch({ by: 'mod', targetId: 'p2' });
   const r1 = await h.service.requestFloor({ userId: 'p1' });
   await h.discord.vote(r1.poll.messageId, 'x'); // roster p1: [p2, x] => 2 necesarios
@@ -99,7 +99,7 @@ test('abandonar voz durante el permiso lo cancela; al volver se vuelve a silenci
   await approve(h, msg, voters);
   await h.discord.leave('req');
   assert.deepEqual(h.store.snapshot().permits, {});
-  assert.equal(h.clock.timers.length, 0, 'se canceló el temporizador');
+  assert.equal(h.clock.timers.length, 1, 'solo queda el temporizador del castigo: el del permiso se canceló');
   assert.match(h.discord.messages.get(msg).content, /PERMISO CANCELADO/);
 
   await h.discord.join('req', 'v1', false); // sigue sin silencio (el permiso lo había levantado)
@@ -126,12 +126,12 @@ test('quitar de la vigilancia durante un permiso lo cancela y deja al usuario si
   assert.equal(h.discord.getVoiceState('req').serverMute, false, 'el temporizador viejo no actúa');
 });
 
-test('finalizar durante permisos vigentes los cancela sin re-silenciar', async () => {
+test('terminar la vigilancia durante un permiso vigente lo cancela sin re-silenciar', async () => {
   const { h, msg, voters } = await setup(['a']);
   await approve(h, msg, voters);
   const before = h.discord.muteCalls.length;
-  const res = await h.service.applyFinalize({ by: 'mod' });
-  assert.equal(res.summary.permitsCancelled, 1);
+  const res = await h.service.applyUnwatch({ by: 'mod', targetId: 'req' });
+  assert.equal(res.ok, true);
   assert.deepEqual(h.store.snapshot().permits, {});
   assert.equal(h.discord.muteCalls.length, before, 'ya estaba habilitado a hablar: no hay nada que liberar');
   await h.clock.advance(200_000);

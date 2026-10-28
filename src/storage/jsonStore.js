@@ -3,14 +3,14 @@
 const fs = require('node:fs/promises');
 const fsSync = require('node:fs');
 const path = require('node:path');
-const { emptyState, validateState } = require('./state');
+const { emptyState, validateState, needsMigration } = require('./state');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * Persistencia local en un único archivo JSON con escritura atómica
  * (archivo temporal + rename). Se eligió JSON en lugar de SQLite porque el estado
- * es pequeño (una patrulla, pocas votaciones), no agrega dependencias ni módulos
+ * es pequeño (pocas vigilancias y votaciones), no agrega dependencias ni módulos
  * experimentales y es legible/recuperable a mano.
  *
  * Además toma un lock de proceso (pid) para impedir dos instancias del bot a la vez.
@@ -71,16 +71,35 @@ class JsonStore {
       if (err.code === 'ENOENT') return emptyState();
       throw err;
     }
+    let raw;
     try {
-      return validateState(JSON.parse(text));
+      raw = JSON.parse(text);
     } catch (err) {
-      const e = new Error(
-        `El archivo de estado ${this.file} está corrupto o es incompatible (${err.message}). ` +
-          'Revisalo manualmente: si lo borrás se pierde el rastro de mutes aplicados por el bot (ver README, "Recuperación").',
-      );
-      e.code = 'CORRUPT_STATE';
-      throw e;
+      throw this._corrupt(err);
     }
+    // Formato anterior: antes de migrar se hace una copia de respaldo del archivo ORIGINAL. Si no se puede
+    // respaldar, no se migra (el error se propaga y el bot no arranca) para no perder datos.
+    let backupName = null;
+    if (needsMigration(raw)) {
+      backupName = `${path.basename(this.file)}.v${raw.version}-backup-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+      await fs.copyFile(this.file, path.join(this.dir, backupName));
+    }
+    try {
+      const state = validateState(raw);
+      if (backupName && state.migration) state.migration.backup = backupName;
+      return state;
+    } catch (err) {
+      throw this._corrupt(err);
+    }
+  }
+
+  _corrupt(err) {
+    const e = new Error(
+      `El archivo de estado ${this.file} está corrupto o es incompatible (${err.message}). ` +
+        'Revisalo manualmente: si lo borrás se pierde el rastro de mutes aplicados por el bot (ver docs/OPERACION.md, "Recuperar silencios").',
+    );
+    e.code = 'CORRUPT_STATE';
+    return e;
   }
 
   /** Guarda de forma atómica. Las escrituras se serializan. */

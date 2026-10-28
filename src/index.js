@@ -25,6 +25,9 @@ async function preflight(client, config, logger) {
   if (!me.permissions.has(PermissionFlagsBits.MuteMembers)) {
     logger.warn('Al bot le falta el permiso "Silenciar miembros" en el servidor: no podrá silenciar a nadie.');
   }
+  if (!me.permissions.has(PermissionFlagsBits.ModerateMembers)) {
+    logger.warn('Al bot le falta el permiso "Aislar temporalmente a miembros": no podrá aplicar el aislamiento por reconexiones.');
+  }
   let channel = null;
   try {
     channel = await client.channels.fetch(config.votingChannelId);
@@ -72,7 +75,7 @@ async function main() {
   const shutdown = (signal) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    logger.info(`Recibido ${signal}: cerrando. El estado ya está guardado; la patrulla (si existe) sigue activa al reiniciar.`);
+    logger.info(`Recibido ${signal}: cerrando. El estado ya está guardado; las vigilancias activas conservan su vencimiento al reiniciar.`);
     service.shutdown();
     client.destroy();
     store.releaseLock();

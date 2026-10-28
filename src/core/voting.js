@@ -6,10 +6,8 @@ const NO = '❌';
 /** Tipos de votación. Todos comparten padrón fijo, reacciones, mayoría y persistencia. */
 const POLL_TYPES = Object.freeze({
   SPEAK_PERMISSION: 'SPEAK_PERMISSION', // un vigilado pide hablar
-  START_PATROL: 'START_PATROL', // iniciar la patrulla vigilando a un usuario
-  ADD_WATCH: 'ADD_WATCH', // sumar un usuario a la patrulla activa
-  REMOVE_WATCH: 'REMOVE_WATCH', // dejar de vigilar a un usuario
-  END_PATROL: 'END_PATROL', // finalizar la patrulla completa
+  START_WATCH: 'START_WATCH', // iniciar una vigilancia (castigo temporal) a un usuario
+  END_WATCH: 'END_WATCH', // terminar anticipadamente la vigilancia de un usuario
 });
 
 /** Mayoría simple estricta: floor(n/2) + 1. */

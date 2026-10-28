@@ -1,5 +1,6 @@
 'use strict';
 
+const { PermissionFlagsBits } = require('discord.js');
 const { DiscordOpError } = require('../core/errors');
 
 function mapError(err) {
@@ -56,6 +57,55 @@ class DiscordAdapter {
       members.push({ id: state.id, bot: !!bot });
     }
     return members;
+  }
+
+  async _member(userId, force = false) {
+    const guild = this.guild;
+    if (!guild) throw new DiscordOpError('NOT_FOUND', 'el bot no está en el servidor configurado');
+    try {
+      return await guild.members.fetch({ user: userId, force });
+    } catch (err) {
+      throw mapError(err);
+    }
+  }
+
+  /** Timeout vigente del miembro (se consulta a la API, no a la caché). */
+  async getTimeoutInfo(userId) {
+    const member = await this._member(userId, true);
+    return { until: member.communicationDisabledUntilTimestamp ?? null };
+  }
+
+  /**
+   * ¿Puede el bot aplicar un timeout a este miembro? Discord no permite aislar al dueño ni a quien
+   * tenga Administrador, exige el permiso ModerateMembers y un rol del bot por encima del usuario.
+   * @returns {Promise<{ ok: boolean, reason?: string }>}
+   */
+  async canTimeout(userId) {
+    const member = await this._member(userId);
+    const guild = this.guild;
+    const me = guild.members.me ?? (await guild.members.fetchMe());
+    if (member.id === guild.ownerId) return { ok: false, reason: 'es el dueño del servidor (Discord no permite aislarlo)' };
+    if (member.permissions.has(PermissionFlagsBits.Administrator)) {
+      return { ok: false, reason: 'tiene el permiso de Administrador (Discord no permite aislar administradores)' };
+    }
+    if (!me.permissions.has(PermissionFlagsBits.ModerateMembers)) {
+      return { ok: false, reason: 'al bot le falta el permiso "Aislar temporalmente a miembros" (ModerateMembers)' };
+    }
+    if (!member.manageable) {
+      return { ok: false, reason: 'su rol más alto está por encima o al mismo nivel que el del bot (jerarquía de roles)' };
+    }
+    return { ok: true };
+  }
+
+  /** Aplica el timeout nativo de Discord hasta `untilMs` (timestamp absoluto). */
+  async timeoutMember(userId, untilMs, reason) {
+    const guild = this.guild;
+    if (!guild) throw new DiscordOpError('NOT_FOUND', 'el bot no está en el servidor configurado');
+    try {
+      await guild.members.edit(userId, { communicationDisabledUntil: new Date(untilMs), reason });
+    } catch (err) {
+      throw mapError(err);
+    }
   }
 
   getChannelName(channelId) {

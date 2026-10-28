@@ -19,55 +19,87 @@ const target = (id = 'u1', extra = {}) => ({ id, bot: false, isMember: true, ...
 const run = (h, name, permissions, extra = {}) =>
   runCommand({ name, guildId: 'G', userId: 'mod', permissions, ...extra }, h.service, h.config);
 
-test('permisos: iniciar/finalizar exigen ManageGuild; vigilar/estado aceptan MuteMembers', async () => {
+test('/vigilar solo publica la votación; la vigilancia empieza recién al aprobarse (sin patrulla previa)', async () => {
+  const h = await createHarness();
+  for (const u of ['u1', 'a', 'b']) await h.discord.join(u, 'v1');
+  const out = await run(h, 'vigilar', MOD, { target: target('u1') });
+  assert.match(out, /Votación para vigilar/);
+  assert.deepEqual(h.snapWatchedIds(), [], 'el comando no vigila: solo publica la votación');
+  assert.equal(h.discord.getVoiceState('u1').serverMute, false);
+
+  const id = h.discord.lastVoteMessage('START_WATCH').id;
+  await h.discord.vote(id, 'a'); // 2 habilitados (a, b): hace falta 2
+  assert.deepEqual(h.snapWatchedIds(), []);
+  await h.discord.vote(id, 'b');
+  assert.deepEqual(h.snapWatchedIds(), ['u1'], 'se aprobó: recién ahí empieza la vigilancia');
+  assert.equal(h.discord.getVoiceState('u1').serverMute, true);
+});
+
+test('permisos: vigilar, dejar-vigilar y estado exigen MuteMembers (o ManageGuild); pedir-palabra es libre', async () => {
   const h = await createHarness();
   for (const u of ['u1', 'u2', 'a']) await h.discord.join(u, 'v1');
-  assert.match(await run(h, 'policia-iniciar', MOD, { target: target() }), /No tenés permisos/);
-  assert.match(await run(h, 'policia-iniciar', NONE, { target: target() }), /No tenés permisos/);
-  assert.match(await run(h, 'policia-iniciar', null, { target: target() }), /No tenés permisos/);
-  assert.equal(h.store.snapshot().polls && Object.keys(h.store.snapshot().polls).length, 0, 'un rechazo no publica nada');
+  for (const denied of [NONE, null]) {
+    assert.match(await run(h, 'vigilar', denied, { target: target('u1') }), /No tenés permisos/);
+    assert.match(await run(h, 'dejar-vigilar', denied, { target: target('u1') }), /No tenés permisos/);
+    assert.match(await run(h, 'policia-estado', denied), /No tenés permisos/);
+  }
+  assert.deepEqual(Object.keys(h.store.snapshot().polls), [], 'un rechazo por permisos no publica nada');
 
-  assert.match(await run(h, 'policia-iniciar', ADMIN, { target: target() }), /Votación para iniciar la patrulla/);
-  assert.equal(h.store.snapshot().patrol, null, 'el comando solo publica la votación');
-  await h.discord.vote(h.discord.lastVoteMessage('START_PATROL').id, 'a'); // 2 habilitados (a, u2): hace falta 2
-  await h.discord.vote(h.discord.lastVoteMessage('START_PATROL').id, 'u2');
-  assert.ok(h.store.snapshot().patrol, 'se aprobó: recién ahí empieza la patrulla');
-
-  assert.match(await run(h, 'vigilar', NONE, { target: target('u2') }), /No tenés permisos/);
-  assert.match(await run(h, 'vigilar', MOD, { target: target('u2') }), /Votación para vigilar/);
-  assert.match(await run(h, 'dejar-vigilar', NONE, { target: target('u1') }), /No tenés permisos/);
+  assert.match(await run(h, 'vigilar', MOD, { target: target('u1') }), /Votación para vigilar/);
+  assert.match(await run(h, 'vigilar', ADMIN, { target: target('u2') }), /Votación para vigilar/, 'ManageGuild también alcanza');
+  await h.service.applyWatch({ by: 'mod', targetId: 'u1' });
   assert.match(await run(h, 'dejar-vigilar', MOD, { target: target('u1') }), /Votación para dejar de vigilar/);
-  assert.match(await run(h, 'policia-estado', NONE), /No tenés permisos/);
-  assert.match(await run(h, 'policia-estado', MOD), /Patrulla activa/);
-  assert.match(await run(h, 'policia-finalizar', MOD), /No tenés permisos/);
-  assert.equal(h.store.snapshot().patrol !== null, true);
+  assert.match(await run(h, 'policia-estado', MOD), /Vigilancias activas/);
+  assert.match(await run(h, 'pedir-palabra', NONE), /No estás siendo vigilado/);
+});
+
+test('/policia-iniciar y /policia-finalizar ya no existen: no están registrados ni se ejecutan', async () => {
+  const h = await createHarness();
+  assert.ok(!buildCommandJSON().some((c) => ['policia-iniciar', 'policia-finalizar'].includes(c.name)));
+  for (const name of ['policia-iniciar', 'policia-finalizar']) {
+    assert.match(await run(h, name, ADMIN, { target: target() }), /error interno/);
+  }
+  assert.deepEqual(h.snapWatchedIds(), []);
 });
 
 test('los comandos no ejecutan nada en un servidor distinto al configurado', async () => {
   const h = await createHarness();
+  await h.discord.join('u1', 'v1');
+  await h.discord.join('a', 'v1');
   const out = await runCommand(
-    { name: 'policia-iniciar', guildId: 'OTRO', userId: 'mod', permissions: ADMIN, target: target() },
+    { name: 'vigilar', guildId: 'OTRO', userId: 'mod', permissions: ADMIN, target: target() },
     h.service,
     h.config,
   );
   assert.match(out, /solo funciona/);
-  assert.equal(h.store.snapshot().patrol, null);
+  assert.deepEqual(Object.keys(h.store.snapshot().polls), []);
 });
 
-test('no se vigila a bots ni a usuarios que no están en el servidor', async () => {
+test('/vigilar: no se vigila a bots, a no miembros ni a usuarios desconectados; sin votantes tampoco', async () => {
   const h = await createHarness();
-  assert.match(await run(h, 'policia-iniciar', ADMIN, { target: target('x', { isMember: false }) }), /no es miembro/);
-  assert.match(await run(h, 'policia-iniciar', ADMIN, { target: target('b', { bot: true }) }), /bot/);
-  assert.match(await run(h, 'policia-iniciar', ADMIN, { target: target('off') }), /no está conectado/);
-  assert.equal(h.store.snapshot().patrol, null);
+  assert.match(await run(h, 'vigilar', MOD, { target: target('x', { isMember: false }) }), /no es miembro/);
+  assert.match(await run(h, 'vigilar', MOD, { target: target('b', { bot: true }) }), /bot/);
+  assert.match(await run(h, 'vigilar', MOD, { target: target('off') }), /no está conectado/);
+  await h.discord.join('alone', 'v1');
+  assert.match(await run(h, 'vigilar', MOD, { target: target('alone') }), /No hay votantes habilitados/);
+  assert.deepEqual(Object.keys(h.store.snapshot().polls), []);
+  assert.deepEqual(h.snapWatchedIds(), []);
+});
+
+test('/vigilar: un usuario con vigilancia vigente o con votación pendiente no se puede volver a solicitar', async () => {
+  const h = await createHarness();
+  for (const u of ['u1', 'a']) await h.discord.join(u, 'v1');
+  assert.match(await run(h, 'vigilar', MOD, { target: target('u1') }), /Votación para vigilar/);
+  assert.match(await run(h, 'vigilar', MOD, { target: target('u1') }), /votación pendiente/);
+  await h.service.applyWatch({ by: 'mod', targetId: 'u1' });
+  assert.match(await run(h, 'vigilar', MOD, { target: target('u1') }), /ya está cumpliendo una vigilancia/);
 });
 
 test('respuestas claras cuando no se cumplen las condiciones de /pedir-palabra', async () => {
   const h = await createHarness();
-  assert.match(await run(h, 'pedir-palabra', NONE), /No hay una patrulla activa/);
   await h.discord.join('u1', 'v1');
-  await h.service.applyStartPatrol({ by: 'mod', targetId: 'u1' });
   assert.match(await run(h, 'pedir-palabra', NONE), /No estás siendo vigilado/);
+  await h.service.applyWatch({ by: 'mod', targetId: 'u1' });
   const asU1 = (n) => runCommand({ name: n, guildId: 'G', userId: 'u1', permissions: NONE }, h.service, h.config);
   assert.match(await asU1('pedir-palabra'), /No hay votantes habilitados/);
 });
@@ -76,7 +108,7 @@ test('/pedir-palabra desde un vigilado con votantes publica la solicitud', async
   const h = await createHarness();
   await h.discord.join('u1', 'v1');
   await h.discord.join('a', 'v1');
-  await h.service.applyStartPatrol({ by: 'mod', targetId: 'u1' });
+  await h.service.applyWatch({ by: 'mod', targetId: 'u1' });
   const out = await runCommand({ name: 'pedir-palabra', guildId: 'G', userId: 'u1', permissions: NONE }, h.service, h.config);
   assert.match(out, /Solicitud publicada/);
   assert.match(
@@ -88,16 +120,18 @@ test('/pedir-palabra desde un vigilado con votantes publica la solicitud', async
 test('hasPermissionLevel', () => {
   assert.equal(hasPermissionLevel(null, null), true);
   assert.equal(hasPermissionLevel(NONE, 'mod'), false);
-  assert.equal(hasPermissionLevel(perms(PermissionFlagsBits.Administrator), 'admin'), true, 'Administrador implícito');
+  assert.equal(hasPermissionLevel(perms(PermissionFlagsBits.Administrator), 'mod'), true, 'Administrador implícito');
+  assert.equal(hasPermissionLevel(ADMIN, 'mod'), true);
+  assert.equal(hasPermissionLevel(MOD, 'mod'), true);
 });
 
 test('definición de slash commands: nombres, opciones y sin permiso global de administrador', () => {
   const cmds = buildCommandJSON();
   assert.deepEqual(
     cmds.map((c) => c.name),
-    ['policia-iniciar', 'vigilar', 'dejar-vigilar', 'policia-finalizar', 'policia-estado', 'pedir-palabra'],
+    ['vigilar', 'dejar-vigilar', 'policia-estado', 'pedir-palabra'],
   );
-  for (const name of ['policia-iniciar', 'vigilar', 'dejar-vigilar']) {
+  for (const name of ['vigilar', 'dejar-vigilar']) {
     const opt = cmds.find((c) => c.name === name).options[0];
     assert.deepEqual([opt.name, opt.type, opt.required], ['usuario', 6, true]);
   }

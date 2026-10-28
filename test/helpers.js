@@ -66,6 +66,11 @@ class FakeDiscord {
     this.failSend = false;
     this.failReactions = false;
     this.channelNames = {};
+    // timeouts (aislamiento)
+    this.timeouts = new Map(); // userId -> until (timestamp absoluto)
+    this.timeoutCalls = []; // { userId, until }
+    this.timeoutBlockers = new Map(); // userId -> motivo (dueño / administrador / jerarquía)
+    this.failTimeout = null; // DiscordOpError a lanzar en timeoutMember
   }
 
   getVoiceState(userId) {
@@ -98,6 +103,21 @@ class FakeDiscord {
     return [...this.voice.entries()]
       .filter(([, vs]) => vs.channelId === channelId)
       .map(([id]) => ({ id, bot: this.bots.has(id) }));
+  }
+
+  async getTimeoutInfo(userId) {
+    return { until: this.timeouts.get(userId) ?? null };
+  }
+
+  async canTimeout(userId) {
+    const reason = this.timeoutBlockers.get(userId);
+    return reason ? { ok: false, reason } : { ok: true };
+  }
+
+  async timeoutMember(userId, until) {
+    this.timeoutCalls.push({ userId, until });
+    if (this.failTimeout) throw this.failTimeout;
+    this.timeouts.set(userId, until);
   }
 
   getChannelName(id) {
@@ -215,7 +235,7 @@ class FakeDiscord {
 
   /** Último mensaje de votación de cualquier tipo (palabra o administrativa). */
   lastVoteMessage(type) {
-    const marker = { START_PATROL: 'INICIAR PATRULLA', ADD_WATCH: 'VIGILAR USUARIO', REMOVE_WATCH: 'DEJAR DE VIGILAR', END_PATROL: 'FINALIZAR PATRULLA', SPEAK_PERMISSION: 'PERMISO PARA HABLAR' }[type];
+    const marker = { START_WATCH: 'INICIAR VIGILANCIA', END_WATCH: 'TERMINAR VIGILANCIA', SPEAK_PERMISSION: 'PERMISO PARA HABLAR' }[type];
     return [...this.sent].reverse().find((m) => (marker ? m.content.includes(marker) : m.content.includes('Votantes habilitados'))) ?? null;
   }
 
@@ -231,8 +251,27 @@ const silentLogger = createLogger('error', [], () => {});
  * Crea un entorno completo. `restart()` simula reiniciar el proceso: nuevo servicio sobre el
  * mismo almacén y el mismo Discord (los usuarios siguen en voz).
  */
-async function createHarness({ speak = 120, store = new MemoryStore(), clock = new FakeClock(), discord = new FakeDiscord() } = {}) {
+async function createHarness({
+  speak = 120,
+  store = new MemoryStore(),
+  clock = new FakeClock(),
+  discord = new FakeDiscord(),
+  punish = false,
+} = {}) {
   const config = { guildId: 'G', votingChannelId: 'VC', speakDurationSeconds: speak };
+  // Toda vigilancia es un castigo temporal. Por defecto el harness usa un castigo largo (24 h) y el
+  // aislamiento desactivado, para que los tests de mutes, votaciones y permisos no dependan de los 2 minutos
+  // de producción. `punish: true` o un objeto activa los valores reales de producción (120 s, aislamiento
+  // tras 2 reconexiones) con las sobrescrituras indicadas.
+  Object.assign(config, { basePunishmentSeconds: 86_400, maxPunishmentSeconds: 86_400, isolationDurationSeconds: 300, isolationReconnectLimit: 0 });
+  if (punish) {
+    Object.assign(config, {
+      basePunishmentSeconds: 120,
+      maxPunishmentSeconds: 86_400,
+      isolationReconnectLimit: 2,
+      ...(punish === true ? {} : punish),
+    });
+  }
   const h = { clock, discord, store, config };
   const build = async () => {
     h.service = await PoliciaService.create({ store, discord, clock, logger: silentLogger, config });
@@ -246,6 +285,11 @@ async function createHarness({ speak = 120, store = new MemoryStore(), clock = n
     return h.service;
   };
   h.sentTo = (channelId) => discord.sent.filter((m) => m.channelId === channelId);
+  // Acceso al estado: vigilancias activas en memoria (`watch`) y lo realmente persistido (`snapWatch`).
+  h.watch = (userId) => Object.values(h.service.state.watches).find((w) => w.userId === userId) ?? null;
+  h.snapWatch = (userId) => Object.values(store.snapshot().watches).find((w) => w.userId === userId) ?? null;
+  h.watchedIds = () => Object.values(h.service.state.watches).map((w) => w.userId).sort();
+  h.snapWatchedIds = () => Object.values(store.snapshot().watches).map((w) => w.userId).sort();
   return h;
 }
 

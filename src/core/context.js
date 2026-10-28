@@ -10,6 +10,9 @@
  *   setMute(userId, mute, reason)                -> Promise<void>   (lanza DiscordOpError)
  *   getVoiceChannelMembers(channelId)            -> Promise<{ id, bot }[]>
  *   getChannelName(channelId)                    -> string
+ *   getTimeoutInfo(userId)                       -> Promise<{ until: number|null }>   timeout vigente (API)
+ *   canTimeout(userId)                           -> Promise<{ ok: boolean, reason?: string }>
+ *   timeoutMember(userId, untilMs, reason)       -> Promise<void>   (lanza DiscordOpError)
  *   sendMessage(channelId, content)              -> Promise<{ id, channelId }>
  *   editMessage(channelId, messageId, content)   -> Promise<void>
  *   addReactions(channelId, messageId, emojis)   -> Promise<void>
@@ -28,8 +31,8 @@ function createContext({ state, store, discord, clock, logger, config }) {
     mgr: {},
     now: () => clock.now(),
     save: () => store.save(state),
-    patrol: () => state.patrol,
-    watched: (userId) => state.patrol?.watched[userId] ?? null,
+    /** Vigilancia activa de un usuario (como máximo una) o null. */
+    watched: (userId) => Object.values(state.watches).find((w) => w.userId === userId) ?? null,
 
     /** Publica en el canal configurado. Nunca lanza: un fallo de mensajería no debe romper el estado. */
     async announce(text) {

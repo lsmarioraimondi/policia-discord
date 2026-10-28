@@ -4,7 +4,7 @@ const { errorText } = require('./errors');
 
 const EXPECT_TTL_MS = 15_000;
 const PENDING_RELEASE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
-const REASON_MUTE = 'Policía Discord: patrulla activa';
+const REASON_MUTE = 'Policía Discord: vigilancia activa';
 const REASON_UNMUTE = 'Policía Discord: permiso para hablar';
 const REASON_RELEASE = 'Policía Discord: fin de vigilancia';
 
@@ -16,7 +16,7 @@ const REASON_RELEASE = 'Policía Discord: fin de vigilancia';
  *                            true  => el mute no es del bot, nunca se levanta.
  *  - botMuted   (bool):      el bot aplicó un mute que sigue vigente => es "propio" y puede liberarse.
  *  - pendingOp  (null|'mute'|'unmute'): intención escrita ANTES de llamar a Discord, para resolver cortes a mitad.
- *  - manualUnmute (bool):    un moderador lo des-silenció durante la patrulla; el bot lo respeta hasta que se reconecte.
+ *  - manualUnmute (bool):    un moderador lo des-silenció durante la vigilancia; el bot lo respeta hasta que se reconecte.
  *  - uncertain  (bool):      tras un reinicio no se pudo saber si un mute pendiente se aplicó.
  *
  * Mute "propio" = botMuted && preMuted !== true. Solo esos se liberan, y solo si el usuario
@@ -59,12 +59,13 @@ class MuteManager {
     return w.botMuted === true && w.preMuted !== true;
   }
 
-  newWatched(userId, addedBy) {
-    const { state, now } = this.ctx;
+  /**
+   * Campos de gestión del mute con los que nace una vigilancia (ver storage/state.js).
+   * Si quedó un mute del bot sin liberar de una vigilancia anterior, la propiedad continúa.
+   */
+  initialMuteState(userId) {
+    const { state } = this.ctx;
     const record = {
-      userId,
-      addedAt: now(),
-      addedBy,
       preMuted: null,
       botMuted: false,
       pendingOp: null,
@@ -73,7 +74,6 @@ class MuteManager {
       needsRemute: false,
       remuteAttempts: 0,
     };
-    // Si quedó un mute del bot sin liberar de una patrulla anterior, la propiedad continúa.
     if (state.pendingReleases[userId]) {
       record.preMuted = false;
       record.botMuted = true;
@@ -205,7 +205,7 @@ class MuteManager {
     const { state, discord, logger } = this.ctx;
     const pending = state.pendingReleases[userId];
     if (!pending) return 'none';
-    if (state.patrol?.watched[userId]) return 'watched';
+    if (this.ctx.watched(userId)) return 'watched';
 
     if (this.ctx.now() - pending.since > PENDING_RELEASE_MAX_AGE_MS) {
       delete state.pendingReleases[userId];

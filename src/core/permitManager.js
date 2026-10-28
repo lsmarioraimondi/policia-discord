@@ -28,7 +28,7 @@ class PermitManager {
     const grantedAt = this.ctx.now();
     const permit = {
       userId: poll.requesterId,
-      patrolId: poll.patrolId,
+      watchId: poll.watchId ?? null,
       pollId: poll.id,
       channelId: poll.channelId,
       messageChannelId: poll.messageChannelId,

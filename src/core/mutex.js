@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Cola de exclusión mutua. Todas las operaciones que modifican el estado de la patrulla
+ * Cola de exclusión mutua. Todas las operaciones que modifican el estado de las vigilancias
  * pasan por acá, de modo que comandos, eventos de voz y reacciones concurrentes se
  * ejecutan de a uno y en orden de llegada.
  */

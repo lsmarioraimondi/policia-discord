@@ -23,22 +23,21 @@ test('el mutex ejecuta en orden y sigue funcionando tras un error', async () => 
   assert.deepEqual(log, [1, 2, 3]);
 });
 
-test('dos administradores inician patrulla a la vez: solo una se crea', async () => {
+test('dos administradores vigilan a personas distintas a la vez: ambas vigilancias son independientes', async () => {
   const h = await createHarness();
   const results = await Promise.all([
-    h.service.applyStartPatrol({ by: 'adminA', targetId: 'u1' }),
-    h.service.applyStartPatrol({ by: 'adminB', targetId: 'u2' }),
+    h.service.applyWatch({ by: 'adminA', targetId: 'u1' }),
+    h.service.applyWatch({ by: 'adminB', targetId: 'u2' }),
   ]);
-  assert.deepEqual(results.map((r) => r.ok).sort(), [false, true]);
-  const watched = Object.keys(h.store.snapshot().patrol.watched);
-  assert.equal(watched.length, 1);
-  assert.equal(h.sentTo('VC').filter((m) => /PATRULLA INICIADA/.test(m.content)).length, 1);
+  assert.deepEqual(results.map((r) => r.ok), [true, true], 'no hay ningún bloqueo global');
+  assert.deepEqual(h.snapWatchedIds(), ['u1', 'u2']);
+  assert.equal(h.sentTo('VC').filter((m) => /VIGILANCIA INICIADA/.test(m.content)).length, 2);
 });
 
 test('dos administradores vigilan al mismo usuario a la vez: una sola incorporación', async () => {
   const h = await createHarness();
   await h.discord.join('u2', 'v1');
-  await h.service.applyStartPatrol({ by: 'adminA', targetId: 'u1' });
+  await h.service.applyWatch({ by: 'adminA', targetId: 'u1' });
   const results = await Promise.all([
     h.service.applyWatch({ by: 'adminA', targetId: 'u2' }),
     h.service.applyWatch({ by: 'adminB', targetId: 'u2' }),
@@ -47,41 +46,45 @@ test('dos administradores vigilan al mismo usuario a la vez: una sola incorporac
   assert.equal(h.discord.muteCalls.filter((c) => c.userId === 'u2').length, 1);
 });
 
-test('finalizar y vigilar simultáneos: sin estados inconsistentes', async () => {
+test('terminar una vigilancia y vigilar a otra persona a la vez: sin estados inconsistentes', async () => {
   const h = await createHarness();
+  await h.discord.join('u1', 'v1');
   await h.discord.join('u2', 'v1');
-  await h.service.applyStartPatrol({ by: 'mod', targetId: 'u1' });
-  const [fin, watch] = await Promise.all([
-    h.service.applyFinalize({ by: 'mod' }),
+  await h.service.applyWatch({ by: 'mod', targetId: 'u1' });
+  const [end, start] = await Promise.all([
+    h.service.applyUnwatch({ by: 'mod', targetId: 'u1' }),
     h.service.applyWatch({ by: 'mod', targetId: 'u2' }),
   ]);
-  assert.equal(fin.ok, true);
-  assert.equal(watch.code, 'NO_PATROL', 'se ejecutó después de finalizar, por orden de llegada');
-  assert.equal(h.discord.getVoiceState('u2').serverMute, false);
+  assert.equal(end.ok, true);
+  assert.equal(start.ok, true);
+  assert.deepEqual(h.snapWatchedIds(), ['u2']);
+  assert.equal(h.discord.getVoiceState('u1').serverMute, false);
+  assert.equal(h.discord.getVoiceState('u2').serverMute, true);
+  assert.equal(h.clock.timers.length, 1, 'solo el temporizador de u2');
 });
 
 test('el mismo vigilado pide palabra dos veces a la vez: una sola votación', async () => {
   const h = await createHarness();
   await h.discord.join('req', 'v1');
   await h.discord.join('a', 'v1');
-  await h.service.applyStartPatrol({ by: 'mod', targetId: 'req' });
+  await h.service.applyWatch({ by: 'mod', targetId: 'req' });
   const results = await Promise.all([h.service.requestFloor({ userId: 'req' }), h.service.requestFloor({ userId: 'req' })]);
   assert.deepEqual(results.map((r) => r.code ?? 'ok').sort(), ['ALREADY_REQUESTED', 'ok']);
   assert.equal(Object.keys(h.store.snapshot().polls).length, 1);
   assert.equal(h.discord.sent.filter((m) => /PERMISO PARA HABLAR/.test(m.content)).length, 1);
 });
 
-test('votos a favor y finalización en carrera: nunca queda un permiso ni temporizador colgado', async () => {
+test('votos a favor y fin de la vigilancia en carrera: nunca queda un permiso ni temporizador colgado', async () => {
   const h = await createHarness();
   await h.discord.join('req', 'v1');
   await h.discord.join('a', 'v1');
-  await h.service.applyStartPatrol({ by: 'mod', targetId: 'req' });
+  await h.service.applyWatch({ by: 'mod', targetId: 'req' });
   const r = await h.service.requestFloor({ userId: 'req' });
   h.discord.messages.get(r.poll.messageId).reactions['✅'] = new Set(['a']);
-  await Promise.all([h.service.onReactionChange(r.poll.messageId), h.service.applyFinalize({ by: 'mod' })]);
+  await Promise.all([h.service.onReactionChange(r.poll.messageId), h.service.applyUnwatch({ by: 'mod', targetId: 'req' })]);
   await h.discord.flush();
   const s = h.store.snapshot();
-  assert.deepEqual([s.patrol, s.permits, s.polls], [null, {}, {}]);
+  assert.deepEqual([s.watches, s.permits, s.polls], [{}, {}, {}]);
   assert.equal(h.clock.timers.length, 0);
   assert.equal(h.discord.getVoiceState('req').serverMute, false);
 });
@@ -89,7 +92,7 @@ test('votos a favor y finalización en carrera: nunca queda un permiso ni tempor
 test('ráfaga de eventos de voz mientras se vota: el estado final es coherente', async () => {
   const h = await createHarness();
   for (const u of ['req', 'a', 'b']) await h.discord.join(u, 'v1');
-  await h.service.applyStartPatrol({ by: 'mod', targetId: 'req' });
+  await h.service.applyWatch({ by: 'mod', targetId: 'req' });
   const r = await h.service.requestFloor({ userId: 'req' });
   h.discord.messages.get(r.poll.messageId).reactions['✅'] = new Set(['a', 'b']);
   await Promise.all([
@@ -105,11 +108,13 @@ test('ráfaga de eventos de voz mientras se vota: el estado final es coherente',
   else assert.equal(h.discord.getVoiceState('req').serverMute, true);
 });
 
-test('un fallo de disco al guardar no deja una patrulla a medio crear', async () => {
+test('un fallo de disco al guardar no deja una vigilancia a medio crear', async () => {
   const h = await createHarness();
   h.store.failNextSave = true;
-  await assert.rejects(() => h.service.applyStartPatrol({ by: 'mod', targetId: 'u1' }), /disco/);
-  assert.equal((await h.service.getStatus()).active, false);
-  const ok = await h.service.applyStartPatrol({ by: 'mod', targetId: 'u1' });
+  await assert.rejects(() => h.service.applyWatch({ by: 'mod', targetId: 'u1' }), /disco/);
+  assert.deepEqual((await h.service.getStatus()).watches, []);
+  assert.deepEqual(h.service.state.streak, { lastUserId: null, count: 0 }, 'la racha se revierte');
+  const ok = await h.service.applyWatch({ by: 'mod', targetId: 'u1' });
   assert.equal(ok.ok, true, 'el mutex no quedó bloqueado');
+  assert.equal(ok.watch.streakCount, 1);
 });

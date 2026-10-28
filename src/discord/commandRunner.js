@@ -37,11 +37,6 @@ async function runCommand(input, service, config) {
   if (!hasPermissionLevel(permissions, levelByCommand[name])) return reply('NO_PERMISSION');
 
   switch (name) {
-    case 'policia-iniciar': {
-      if (!target.isMember) return reply('NOT_IN_GUILD');
-      const res = await service.requestStartPatrol({ by: userId, targetId: target.id, targetIsBot: target.bot });
-      return res.ok ? pollReply(`Votación para iniciar la patrulla vigilando a ${messages.user(target.id)}`, res, config) : reply(res.code);
-    }
     case 'vigilar': {
       if (!target.isMember) return reply('NOT_IN_GUILD');
       const res = await service.requestWatch({ by: userId, targetId: target.id, targetIsBot: target.bot });
@@ -50,10 +45,6 @@ async function runCommand(input, service, config) {
     case 'dejar-vigilar': {
       const res = await service.requestUnwatch({ by: userId, targetId: target.id });
       return res.ok ? pollReply(`Votación para dejar de vigilar a ${messages.user(target.id)}`, res, config) : reply(res.code);
-    }
-    case 'policia-finalizar': {
-      const res = await service.requestEndPatrol({ by: userId });
-      return res.ok ? pollReply('Votación para finalizar la patrulla', res, config) : reply(res.code);
     }
     case 'policia-estado':
       return truncate(formatStatus(await service.getStatus()));

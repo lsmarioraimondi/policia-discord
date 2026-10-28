@@ -4,7 +4,7 @@ const { randomUUID } = require('node:crypto');
 const { YES, NO, POLL_TYPES, majority, buildRoster, tally, decide } = require('./voting');
 const { messages } = require('../messages');
 
-const ADMIN_TYPES = [POLL_TYPES.START_PATROL, POLL_TYPES.ADD_WATCH, POLL_TYPES.REMOVE_WATCH, POLL_TYPES.END_PATROL];
+const ADMIN_TYPES = [POLL_TYPES.START_WATCH, POLL_TYPES.END_WATCH];
 
 /**
  * Votaciones (pedir palabra y decisiones administrativas). Todas comparten el mismo
@@ -14,9 +14,9 @@ const ADMIN_TYPES = [POLL_TYPES.START_PATROL, POLL_TYPES.ADD_WATCH, POLL_TYPES.R
  * independiente; lo que cambia entre tipos es solo el padrón y la acción al aprobarse
  * (ver PoliciaService._approve).
  *
- * Campos de una votación: id, type, patrolId (null si aún no hay patrulla), requesterId
- * (quien la solicitó), targetId (usuario afectado; null en END_PATROL), channelId /
- * channelIds, messageId, roster, needed, votes, status, createdAt.
+ * Campos de una votación: id, type, requesterId (quien la solicitó), targetId (usuario afectado),
+ * watchId (vigilancia a la que se refiere: la que se quiere terminar o en la que se pide hablar),
+ * channelId, messageId, roster, needed, votes, status, createdAt.
  */
 class VotingManager {
   constructor(ctx) {
@@ -46,11 +46,13 @@ class VotingManager {
    * @param {object} spec
    * @param {string} spec.type          uno de POLL_TYPES
    * @param {string} spec.requesterId   quien la solicita
-   * @param {string|null} spec.targetId usuario afectado (null en END_PATROL)
+   * @param {string} spec.targetId      usuario afectado
+   * @param {string|null} [spec.watchId]  vigilancia a la que se refiere (END_WATCH / SPEAK_PERMISSION)
    * @param {string[]} spec.channelIds  canales de voz de los que sale el padrón
    * @param {{id:string,bot?:boolean}[]} spec.members  humanos/bots presentes en esos canales
-   * @param {Iterable<string>} spec.exclude  ids que no votan (afectado, solicitante, vigilados)
-   * @param {string[]} [spec.watchedIds]  solo END_PATROL: vigilados al momento de la solicitud
+   * @param {Iterable<string>} spec.exclude  ids que no votan (afectado, solicitante)
+   * @param {number} [spec.proposedSeconds]  START_WATCH: duración propuesta (la definitiva se calcula al aprobarse)
+   * @param {number} [spec.proposedCount]    START_WATCH: n.º de castigo consecutivo propuesto
    * @returns {Promise<{ ok: true, poll, reactionsFailed: boolean } | { ok: false, code: string }>}
    */
   async create(spec) {
@@ -61,12 +63,13 @@ class VotingManager {
     const poll = {
       id: randomUUID(),
       type: spec.type,
-      patrolId: state.patrol?.id ?? null,
       requesterId: spec.requesterId,
-      targetId: spec.targetId ?? null,
+      targetId: spec.targetId,
+      watchId: spec.watchId ?? null,
       channelId: spec.channelIds[0] ?? null,
       channelIds: spec.channelIds,
-      watchedIds: spec.watchedIds ?? [],
+      proposedSeconds: spec.proposedSeconds ?? null, // START/ADD: duración de castigo propuesta al crearla
+      proposedCount: spec.proposedCount ?? null,
       messageId: null,
       messageChannelId: config.votingChannelId,
       roster,

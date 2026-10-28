@@ -5,27 +5,17 @@ const { SlashCommandBuilder, PermissionFlagsBits, InteractionContextType } = req
 /**
  * Niveles de permiso (la verificación en tiempo de ejecución es la autoritativa;
  * `setDefaultMemberPermissions` solo oculta el comando en la interfaz para quien no corresponde):
- *  - admin: ManageGuild                       (iniciar / finalizar patrulla)
  *  - mod:   MuteMembers o ManageGuild         (vigilar, dejar de vigilar, estado)
  *  - null:  cualquiera                        (pedir la palabra; el núcleo exige que esté vigilado)
  * Quien tenga el permiso global de Administrador pasa todos los niveles automáticamente.
  */
 const definitions = [
   {
-    name: 'policia-iniciar',
-    level: 'admin',
-    build: (b) =>
-      b
-        .setDescription('Propone iniciar una patrulla vigilando a un usuario (se vota)')
-        .addUserOption((o) => o.setName('usuario').setDescription('Primer usuario a vigilar').setRequired(true))
-        .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-  },
-  {
     name: 'vigilar',
     level: 'mod',
     build: (b) =>
       b
-        .setDescription('Propone vigilar a un usuario en la patrulla activa (se vota)')
+        .setDescription('Propone vigilar (castigar temporalmente) a un usuario conectado a voz; se vota')
         .addUserOption((o) => o.setName('usuario').setDescription('Usuario a vigilar').setRequired(true))
         .setDefaultMemberPermissions(PermissionFlagsBits.MuteMembers),
   },
@@ -34,22 +24,16 @@ const definitions = [
     level: 'mod',
     build: (b) =>
       b
-        .setDescription('Propone dejar de vigilar a un usuario (se vota)')
+        .setDescription('Propone terminar antes de tiempo la vigilancia de un usuario; se vota')
         .addUserOption((o) => o.setName('usuario').setDescription('Usuario a dejar de vigilar').setRequired(true))
         .setDefaultMemberPermissions(PermissionFlagsBits.MuteMembers),
-  },
-  {
-    name: 'policia-finalizar',
-    level: 'admin',
-    build: (b) =>
-      b.setDescription('Propone finalizar la patrulla y dejar de vigilar a todos (se vota)').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   },
   {
     name: 'policia-estado',
     level: 'mod',
     build: (b) =>
       b
-        .setDescription('Muestra el estado de la patrulla')
+        .setDescription('Muestra las vigilancias activas, sus vencimientos y las votaciones pendientes')
         .setDefaultMemberPermissions(PermissionFlagsBits.MuteMembers),
   },
   {
@@ -72,7 +56,6 @@ const levelByCommand = Object.fromEntries(definitions.map((d) => [d.name, d.leve
 function hasPermissionLevel(permissions, level) {
   if (level === null) return true;
   if (!permissions) return false;
-  if (level === 'admin') return permissions.has(PermissionFlagsBits.ManageGuild);
   return permissions.has(PermissionFlagsBits.MuteMembers) || permissions.has(PermissionFlagsBits.ManageGuild);
 }
 

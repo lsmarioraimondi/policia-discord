@@ -1,22 +1,34 @@
 'use strict';
 
-const { randomUUID } = require('node:crypto');
 const { createContext } = require('./context');
 const { Mutex } = require('./mutex');
 const { MuteManager } = require('./muteManager');
 const { VotingManager } = require('./votingManager');
 const { POLL_TYPES } = require('./voting');
 const { PermitManager } = require('./permitManager');
+const { WatchManager } = require('./watchManager');
+const { errorText } = require('./errors');
 const { messages } = require('../messages');
 
 const TICK_MS = 5000;
 const MAX_REMUTE_ATTEMPTS = 10;
 
+/** Tipos de votación de formatos anteriores -> tipo actual (solo para redactar bien su cancelación al migrar). */
+const LEGACY_POLL_TYPES = {
+  START_PATROL: POLL_TYPES.START_WATCH,
+  ADD_WATCH: POLL_TYPES.START_WATCH,
+  REMOVE_WATCH: POLL_TYPES.END_WATCH,
+};
+
 /**
  * Fachada del núcleo de Policía Discord. Toda operación pública pasa por un mutex único:
  * comandos, eventos de voz, reacciones y vencimientos se ejecutan de a uno, en orden de
  * llegada, sobre un estado que se persiste antes de actuar sobre Discord. Los gestores
- * internos (mute/votación/permisos) NO toman el mutex, para evitar bloqueos recursivos.
+ * internos (mute/votación/permisos/vigilancias) NO toman el mutex, para evitar bloqueos recursivos.
+ *
+ * Modelo: una VIGILANCIA es un castigo temporal por usuario. Comienza cuando se aprueba una votación
+ * (`START_WATCH`) y termina automáticamente al vencer, por una votación de fin anticipado (`END_WATCH`)
+ * o por aislamiento. No hay ningún estado global que iniciar o finalizar para poder vigilar.
  *
  * Los métodos devuelven objetos `{ ok, code, ... }`; solo lanzan ante fallos inesperados
  * (p. ej. error de disco), que la capa de interacciones informa como error interno.
@@ -28,6 +40,7 @@ class PoliciaService {
     this.mute = new MuteManager(this.ctx);
     this.voting = new VotingManager(this.ctx);
     this.permits = new PermitManager(this.ctx, (userId, grantedAt) => this._onPermitTimer(userId, grantedAt));
+    this.watches = new WatchManager(this.ctx, (watchId) => this._onWatchTimer(watchId));
     this.tickHandle = null;
   }
 
@@ -54,6 +67,7 @@ class PoliciaService {
     if (this.tickHandle !== null) this.ctx.clock.clearInterval(this.tickHandle);
     this.tickHandle = null;
     this.permits.clearAllTimers();
+    this.watches.clearAllTimers();
   }
 
   recover() {
@@ -62,57 +76,78 @@ class PoliciaService {
 
   async _recover() {
     const { state, discord, logger } = this.ctx;
-    const info = { patrolActive: !!state.patrol, pollsCancelled: [], permitsRestored: 0 };
+    const info = { watchesActive: 0, pollsCancelled: [], permitsRestored: 0, watchesServed: 0, migration: null };
+
+    // 0. Migración desde un formato anterior: se informa una sola vez.
+    if (state.migration && !state.migration.reported) {
+      info.migration = state.migration;
+      state.migration.reported = true;
+    }
 
     // 1. Votaciones interrumpidas: se cancelan de forma segura (el padrón/reacciones no son confiables).
     for (const poll of Object.values(state.polls)) {
-      poll.type ??= POLL_TYPES.SPEAK_PERMISSION; // estados guardados antes de existir los tipos
+      poll.type = LEGACY_POLL_TYPES[poll.type] ?? poll.type ?? POLL_TYPES.SPEAK_PERMISSION;
       poll.targetId ??= poll.requesterId;
     }
     info.pollsCancelled = this.voting.cancelWhere(() => true);
 
-    if (state.patrol) {
-      // 2. Operaciones de mute a medias.
-      for (const [userId, w] of Object.entries(state.patrol.watched)) {
-        if (w.pendingOp) await this.mute.resolvePendingOp(w, discord.getVoiceState(userId));
-      }
-
-      // 3. Permisos: se conservan los vencimientos originales; nunca se renuevan.
-      for (const permit of this.permits.all()) {
-        const vs = discord.getVoiceState(permit.userId);
-        const stillThere = vs?.channelId && vs.channelId === permit.channelId;
-        if (permit.expiresAt <= this.ctx.now()) {
-          await this._expirePermit(permit);
-        } else if (!stillThere) {
-          const [cancelled] = this.permits.cancelWhere((p) => p.userId === permit.userId);
-          await this.ctx.save();
-          await this.permits.notifyCancelled([cancelled], 'salió del canal mientras el bot estaba apagado');
-        } else {
-          this.permits.schedule(permit);
-          info.permitsRestored++;
-        }
-      }
-    } else {
-      this.permits.cancelWhere(() => true); // permisos huérfanos sin patrulla: nunca deberían existir
+    // 2. Operaciones de mute a medias.
+    for (const w of this.watches.all()) {
+      if (w.pendingOp) await this.mute.resolvePendingOp(w, discord.getVoiceState(w.userId));
     }
+
+    // 3. Vigilancias: las vencidas durante el apagado se regularizan ahora (sin votación); el resto se
+    // reprograma con su vencimiento ORIGINAL (nunca se reinician los minutos).
+    for (const w of this.watches.all()) {
+      if (w.expiresAt <= this.ctx.now()) {
+        if ((await this._expireWatch(w.id)).ok) info.watchesServed++;
+      } else {
+        this.watches.schedule(w);
+      }
+    }
+
+    // 4. Permisos: se conservan los vencimientos originales; nunca se renuevan. Un permiso sin
+    // vigilancia activa no puede existir.
+    for (const permit of this.permits.all()) {
+      const vs = discord.getVoiceState(permit.userId);
+      const stillThere = vs?.channelId && vs.channelId === permit.channelId;
+      if (!this.ctx.watched(permit.userId)) {
+        const orphans = this.permits.cancelWhere((p) => p.userId === permit.userId);
+        await this.ctx.save();
+        await this.permits.notifyCancelled(orphans, 'la vigilancia ya no está vigente');
+      } else if (permit.expiresAt <= this.ctx.now()) {
+        await this._expirePermit(permit);
+      } else if (!stillThere) {
+        const [cancelled] = this.permits.cancelWhere((p) => p.userId === permit.userId);
+        await this.ctx.save();
+        await this.permits.notifyCancelled([cancelled], 'salió del canal mientras el bot estaba apagado');
+      } else {
+        this.permits.schedule(permit);
+        info.permitsRestored++;
+      }
+    }
+
+    this.watches.pruneIsolations(); // aislamientos vencidos: Discord ya levantó el timeout
     await this.ctx.save();
     await this.voting.notifyClosed(info.pollsCancelled, 'el bot se reinició durante la votación');
 
-    // 4. Revisar usuarios conectados: re-silenciar vigilados y liberar mutes propios pendientes.
-    for (const userId of Object.keys(state.patrol?.watched ?? {})) {
-      await this.mute.ensureMuted(userId, { joined: false });
-    }
-    for (const userId of Object.keys(state.pendingReleases)) {
-      await this.mute.tryRelease(userId);
-    }
+    // 5. Revisar usuarios conectados: re-silenciar vigilados y liberar mutes propios pendientes.
+    for (const w of this.watches.all()) await this.mute.ensureMuted(w.userId, { joined: false });
+    for (const userId of Object.keys(state.pendingReleases)) await this.mute.tryRelease(userId);
 
-    if (info.patrolActive || info.pollsCancelled.length) {
+    info.watchesActive = this.watches.all().length;
+    if (info.watchesActive || info.pollsCancelled.length || info.watchesServed || info.migration) {
       await this.ctx.announce(messages.recovery(info));
     }
     logger.info(
-      `Recuperación: patrulla ${info.patrolActive ? 'activa' : 'inactiva'}, ` +
+      `Recuperación: ${info.watchesActive} vigilancia(s) activa(s), ${info.watchesServed} vencida(s) durante el apagado, ` +
         `${info.pollsCancelled.length} votación(es) cancelada(s), ${info.permitsRestored} permiso(s) retomado(s).`,
     );
+    if (info.migration) {
+      logger.warn(
+        `Estado migrado desde el formato v${info.migration.fromVersion}. Respaldo del original: ${info.migration.backup ?? '(estado en memoria)'}.`,
+      );
+    }
     return info;
   }
 
@@ -122,17 +157,20 @@ class PoliciaService {
 
   async _tick() {
     const { state } = this.ctx;
+    // Primero las vigilancias vencidas (cancelan sus permisos/votaciones), luego los permisos.
+    for (const w of this.watches.due()) await this._expireWatch(w.id);
     for (const permit of this.permits.due()) await this._expirePermit(permit);
+    if (this.watches.pruneIsolations()) await this.ctx.save();
 
     // Reintentos de re-silenciado tras un fallo de Discord.
-    for (const [userId, w] of Object.entries(state.patrol?.watched ?? {})) {
-      if (!w.needsRemute || state.permits[userId]) continue;
-      const res = await this.mute.ensureMuted(userId);
+    for (const w of this.watches.all()) {
+      if (!w.needsRemute || state.permits[w.userId]) continue;
+      const res = await this.mute.ensureMuted(w.userId);
       if (res.status === 'error') {
         w.remuteAttempts = (w.remuteAttempts ?? 0) + 1;
         if (w.remuteAttempts >= MAX_REMUTE_ATTEMPTS) {
           w.needsRemute = false;
-          await this.ctx.announce(messages.remuteFailed(userId, res.error));
+          await this.ctx.announce(messages.remuteFailed(w.userId, res.error));
         }
         await this.ctx.save();
       } else {
@@ -159,213 +197,197 @@ class PoliciaService {
       .catch((err) => this.ctx.logger.error('Error al vencer un permiso:', err));
   }
 
-  // =============================================================== patrulla (acciones ya aprobadas)
+  _onWatchTimer(watchId) {
+    return this.lock
+      .run(async () => {
+        const w = this.watches.byId(watchId);
+        if (!w) return; // ya terminó por otra vía
+        if (w.expiresAt <= this.ctx.now()) await this._expireWatch(watchId);
+        else this.watches.schedule(w); // el temporizador saltó antes (tope de setTimeout)
+      })
+      .catch((err) => this.ctx.logger.error('Error al vencer una vigilancia:', err));
+  }
+
+  // =============================================================== vigilancias (acciones ya autorizadas)
   //
   // Estas acciones se ejecutan de inmediato. Los comandos de Discord NO las llaman directamente:
   // pasan por una votación (request*) y la acción se ejecuta recién al aprobarse (_approveAdmin).
-
-  applyStartPatrol(args) {
-    return this.lock.run(() => this._startPatrol(args));
-  }
+  // El vencimiento es la única terminación que no requiere votación.
 
   applyWatch(args) {
-    return this.lock.run(() => this._watch(args));
+    return this.lock.run(() => this._startWatch(args));
   }
 
   applyUnwatch(args) {
-    return this.lock.run(() => this._unwatch(args));
+    return this.lock.run(() => this._endWatchEarly(args));
   }
 
-  applyFinalize(args) {
-    return this.lock.run(() => this._finalize(args));
-  }
-
-  async _startPatrol({ by, targetId, targetIsBot = false }) {
-    const { state, config } = this.ctx;
-    if (state.patrol) return { ok: false, code: 'PATROL_ACTIVE' };
+  /** Crea la vigilancia (castigo), avanza la racha global, programa su vencimiento y silencia al usuario. */
+  async _startWatch({ by, targetId, targetIsBot = false, pollId = null }) {
+    const { state } = this.ctx;
     if (targetIsBot) return { ok: false, code: 'TARGET_IS_BOT' };
+    if (this.ctx.watched(targetId)) return { ok: false, code: 'ALREADY_WATCHED' };
 
-    state.patrol = {
-      id: randomUUID(),
-      guildId: config.guildId,
-      startedAt: this.ctx.now(),
-      startedBy: by,
-      watched: {},
-    };
-    state.patrol.watched[targetId] = this.mute.newWatched(targetId, by);
+    const prev = { streak: state.streak, pending: state.pendingReleases[targetId] };
+    const watch = this.watches.create({
+      userId: targetId,
+      requestedBy: by,
+      pollId,
+      muteState: this.mute.initialMuteState(targetId), // la propiedad de un mute propio pendiente continúa
+    });
     try {
       await this.ctx.save();
     } catch (err) {
-      state.patrol = null;
+      delete state.watches[watch.id];
+      state.streak = prev.streak;
+      if (prev.pending) state.pendingReleases[targetId] = prev.pending;
       throw err;
     }
+    this.watches.schedule(watch);
 
     const mute = await this.mute.ensureMuted(targetId, { joined: false });
-    const announced = !!(await this.ctx.announce(messages.patrolStarted(state.patrol, targetId, mute)));
-    return { ok: true, patrol: state.patrol, mute, announced };
+    const announced = !!(await this.ctx.announce(messages.watchStarted(watch, by, mute)));
+    return { ok: true, watch, mute, announced };
   }
 
-  async _watch({ by, targetId, targetIsBot = false }) {
-    const { state } = this.ctx;
-    if (!state.patrol) return { ok: false, code: 'NO_PATROL' };
-    if (targetIsBot) return { ok: false, code: 'TARGET_IS_BOT' };
-    if (state.patrol.watched[targetId]) return { ok: false, code: 'ALREADY_WATCHED' };
-
-    state.patrol.watched[targetId] = this.mute.newWatched(targetId, by);
-    await this.ctx.save();
-    const mute = await this.mute.ensureMuted(targetId, { joined: false });
-    const announced = !!(await this.ctx.announce(messages.watchAdded(targetId, by, mute)));
-    return { ok: true, mute, announced };
-  }
-
-  async _unwatch({ by, targetId }) {
-    const { state } = this.ctx;
-    if (!state.patrol) return { ok: false, code: 'NO_PATROL' };
-    const w = state.patrol.watched[targetId];
+  /** Fin anticipado (ya autorizado por votación). No toca la racha. */
+  async _endWatchEarly({ by, targetId }) {
+    const w = this.ctx.watched(targetId);
     if (!w) return { ok: false, code: 'NOT_WATCHED' };
-
-    const polls = this.voting.cancelWhere((p) => p.targetId === targetId);
-    const permits = this.permits.cancelWhere((p) => p.userId === targetId);
-    this.mute.disown(targetId, w);
-    delete state.patrol.watched[targetId];
-    await this.ctx.save();
-
-    await this.voting.notifyClosed(polls, 'el usuario dejó de ser vigilado');
-    await this.permits.notifyCancelled(permits, 'el usuario dejó de ser vigilado');
-    const release = await this.mute.tryRelease(targetId);
-    const announced = !!(await this.ctx.announce(messages.watchRemoved(targetId, by, release)));
-    return { ok: true, release, announced };
+    const out = await this._closeWatch(w, 'el usuario dejó de ser vigilado');
+    const announced = !!(await this.ctx.announce(messages.watchEndedEarly(targetId, by, out.release)));
+    return { ok: true, release: out.release, announced };
   }
 
-  async _finalize({ by }) {
+  /**
+   * Cierra una vigilancia (vencimiento, fin anticipado o aislamiento): la ELIMINA de las vigilancias
+   * activas, cancela sus votaciones y su permiso, limpia su temporizador, registra su mute propio como
+   * pendiente de liberar y lo intenta liberar. NO toca la racha ni la de otros usuarios.
+   */
+  async _closeWatch(w, reason) {
     const { state } = this.ctx;
-    const patrol = state.patrol;
-    if (!patrol) return { ok: false, code: 'NO_PATROL' };
-
-    // Todo el cambio de estado primero y persistido: si el proceso muere a mitad, la patrulla
-    // ya figura como finalizada y NO se reactiva. Los mutes propios quedan en pendingReleases.
-    const polls = this.voting.cancelWhere(() => true);
-    const permits = this.permits.cancelWhere(() => true);
-    const watchedEntries = Object.entries(patrol.watched);
-    const owned = [];
-    const skipped = [];
-    for (const [userId, w] of watchedEntries) {
-      if (this.mute.disown(userId, w) === 'owned') owned.push(userId);
-      else if (w.preMuted === true || w.uncertain) skipped.push(userId);
-    }
-    state.lastPatrol = { id: patrol.id, startedAt: patrol.startedAt, endedAt: this.ctx.now(), endedBy: by };
-    state.patrol = null;
+    const polls = this.voting.cancelWhere((p) => p.targetId === w.userId);
+    const permits = this.permits.cancelWhere((p) => p.userId === w.userId);
+    this.watches.clearTimer(w.id);
+    this.mute.disown(w.userId, w);
+    delete state.watches[w.id];
     await this.ctx.save();
 
-    await this.voting.notifyClosed(polls, 'la patrulla finalizó');
-    await this.permits.notifyCancelled(permits, 'la patrulla finalizó');
+    await this.voting.notifyClosed(polls, reason);
+    await this.permits.notifyCancelled(permits, reason);
+    const release = await this.mute.tryRelease(w.userId);
+    return { ok: true, release, watch: w };
+  }
 
-    const summary = {
-      watchedCount: watchedEntries.length,
-      pollsCancelled: polls.length,
-      permitsCancelled: permits.length,
-      released: 0,
-      deferred: [],
-      failed: [],
-      skipped,
-    };
-    for (const userId of owned) {
-      const res = await this.mute.tryRelease(userId);
-      if (res === 'released') summary.released++;
-      else if (res === 'deferred') summary.deferred.push(userId);
-      else if (res === 'error') summary.failed.push(userId);
+  /** Fin natural de una vigilancia: no requiere votación ni comando. */
+  async _expireWatch(watchId) {
+    const w = this.watches.byId(watchId);
+    if (!w || w.expiresAt > this.ctx.now()) return { ok: false, code: 'NOT_DUE' };
+    const out = await this._closeWatch(w, 'el castigo venció');
+    await this.ctx.announce(messages.watchServed(w.userId, w, out.release));
+    return { ok: true, release: out.release };
+  }
+
+  /**
+   * Aislamiento (timeout nativo de Discord) tras alcanzar el límite de reconexiones. Se intenta como
+   * máximo UNA vez por vigilancia. Nunca pisa ni acorta un timeout de otro moderador. Si falla, la
+   * vigilancia original continúa hasta su vencimiento. Devuelve true si la vigilancia terminó por esto.
+   */
+  async _tryIsolation(w) {
+    const { state, discord, config, logger } = this.ctx;
+    if (w.isolationAttempted) return false;
+    w.isolationAttempted = true; // antes de actuar: ni un reinicio ni un fallo permiten un segundo intento
+    await this.ctx.save();
+
+    let failure = null;
+    let isolation = null;
+    try {
+      const current = await discord.getTimeoutInfo(w.userId);
+      if (current.until && current.until > this.ctx.now()) {
+        failure = 'ya tiene un timeout vigente de otro moderador (el bot no lo sobrescribe ni lo acorta)';
+      } else {
+        const check = await discord.canTimeout(w.userId);
+        if (!check.ok) {
+          failure = check.reason;
+        } else {
+          const startedAt = this.ctx.now();
+          const until = startedAt + config.isolationDurationSeconds * 1000;
+          await discord.timeoutMember(w.userId, until, 'Policía Discord: reconexiones reiteradas durante un castigo');
+          isolation = {
+            userId: w.userId,
+            startedAt,
+            until,
+            durationSeconds: config.isolationDurationSeconds,
+            watchId: w.id,
+            streakCount: w.streakCount,
+          };
+        }
+      }
+    } catch (err) {
+      logger.warn(`No se pudo aplicar el aislamiento a ${w.userId}: ${err.message}`);
+      failure =
+        err.kind === 'MISSING_PERMISSIONS'
+          ? 'Discord rechazó el timeout (el bot necesita "Aislar temporalmente a miembros" y un rol por encima del usuario)'
+          : errorText(err);
     }
-    summary.announced = !!(await this.ctx.announce(messages.patrolEnded(by, summary)));
-    return { ok: true, summary };
+
+    if (!isolation) {
+      w.isolationFailure = failure;
+      await this.ctx.save();
+      await this.ctx.announce(messages.isolationFailed(w.userId, w, failure));
+      return false;
+    }
+    state.isolations[w.userId] = isolation; // se guarda junto con el cierre de la vigilancia (un solo guardado)
+    await this._closeWatch(w, 'el castigo terminó por aislamiento');
+    await this.ctx.announce(messages.isolationApplied(w.userId, w, isolation));
+    return true;
   }
 
-  // =============================================================== solicitudes (votaciones administrativas)
+  // =============================================================== solicitudes (votaciones)
   //
-  // Ninguna de estas solicitudes modifica la vigilancia: solo publican una votación. Las
-  // solicitudes contradictorias o duplicadas se rechazan al crearlas:
-  //  - una sola START_PATROL pendiente;
-  //  - una sola votación ADD/REMOVE pendiente por usuario afectado;
-  //  - END_PATROL excluye (y es excluida por) cualquier ADD/REMOVE pendiente.
-  // Las votaciones de palabra (SPEAK_PERMISSION) coexisten con todas ellas.
+  // Ninguna de estas solicitudes modifica la vigilancia: solo publican una votación. Se rechazan al
+  // crearlas las duplicadas o contradictorias (una votación de inicio o de fin por usuario). No hay ningún
+  // bloqueo global: las votaciones de distintos usuarios coexisten, y las de palabra con todas ellas.
 
-  requestStartPatrol({ by, targetId, targetIsBot = false }) {
-    return this.lock.run(async () => {
-      if (this.ctx.state.patrol) return { ok: false, code: 'PATROL_ACTIVE' };
-      if (targetIsBot) return { ok: false, code: 'TARGET_IS_BOT' };
-      if (this.voting.openAdmin({ types: [POLL_TYPES.START_PATROL] }).length) return { ok: false, code: 'POLL_PENDING' };
-      return this._createTargetPoll(POLL_TYPES.START_PATROL, by, targetId);
-    });
-  }
-
+  /** `/vigilar`: solicita una vigilancia (castigo temporal). No depende de ningún estado global. */
   requestWatch({ by, targetId, targetIsBot = false }) {
     return this.lock.run(async () => {
-      const { state } = this.ctx;
-      if (!state.patrol) return { ok: false, code: 'NO_PATROL' };
       if (targetIsBot) return { ok: false, code: 'TARGET_IS_BOT' };
-      if (state.patrol.watched[targetId]) return { ok: false, code: 'ALREADY_WATCHED' };
-      return this._createAdjustPoll(POLL_TYPES.ADD_WATCH, by, targetId);
+      if (!this.ctx.discord.getVoiceState(targetId)?.channelId) return { ok: false, code: 'TARGET_NOT_IN_VOICE' };
+      if (this.ctx.watched(targetId)) return { ok: false, code: 'ALREADY_WATCHED' };
+      if (this.voting.openAdmin({ types: [POLL_TYPES.START_WATCH], targetId }).length) return { ok: false, code: 'POLL_PENDING' };
+      return this._createTargetPoll(POLL_TYPES.START_WATCH, by, targetId);
     });
   }
 
+  /** `/dejar-vigilar`: solicita terminar anticipadamente la vigilancia de un usuario. */
   requestUnwatch({ by, targetId }) {
     return this.lock.run(async () => {
-      const { state } = this.ctx;
-      if (!state.patrol) return { ok: false, code: 'NO_PATROL' };
-      if (!state.patrol.watched[targetId]) return { ok: false, code: 'NOT_WATCHED' };
-      return this._createAdjustPoll(POLL_TYPES.REMOVE_WATCH, by, targetId);
+      const w = this.ctx.watched(targetId);
+      if (!w) return { ok: false, code: 'NOT_WATCHED' };
+      if (this.voting.openAdmin({ types: [POLL_TYPES.END_WATCH], targetId }).length) return { ok: false, code: 'POLL_PENDING' };
+      return this._createTargetPoll(POLL_TYPES.END_WATCH, by, targetId, w.id);
     });
-  }
-
-  requestEndPatrol({ by }) {
-    return this.lock.run(async () => {
-      const { state, discord } = this.ctx;
-      const patrol = state.patrol;
-      if (!patrol) return { ok: false, code: 'NO_PATROL' };
-      if (this.voting.openAdmin({ types: [POLL_TYPES.END_PATROL] }).length) return { ok: false, code: 'END_PENDING' };
-      if (this.voting.openAdmin({ types: [POLL_TYPES.ADD_WATCH, POLL_TYPES.REMOVE_WATCH] }).length) {
-        return { ok: false, code: 'ADMIN_POLLS_PENDING' };
-      }
-
-      // Padrón: unión de los humanos NO vigilados que comparten canal con cualquier vigilado.
-      const watchedIds = Object.keys(patrol.watched);
-      const channelIds = [...new Set(watchedIds.map((id) => discord.getVoiceState(id)?.channelId).filter(Boolean))];
-      if (!channelIds.length) return { ok: false, code: 'NO_VOTERS' };
-      const members = await this._membersOf(channelIds);
-      if (!members) return { ok: false, code: 'INTERNAL' };
-      return this.voting.create({
-        type: POLL_TYPES.END_PATROL,
-        requesterId: by,
-        targetId: null,
-        channelIds,
-        members,
-        exclude: watchedIds,
-        watchedIds,
-      });
-    });
-  }
-
-  /** ADD_WATCH / REMOVE_WATCH: valida conflictos con otras votaciones del mismo usuario o con END_PATROL. */
-  async _createAdjustPoll(type, by, targetId) {
-    if (this.voting.openAdmin({ types: [POLL_TYPES.END_PATROL] }).length) return { ok: false, code: 'END_PENDING' };
-    if (this.voting.openAdmin({ types: [POLL_TYPES.ADD_WATCH, POLL_TYPES.REMOVE_WATCH], targetId }).length) {
-      return { ok: false, code: 'POLL_PENDING' };
-    }
-    return this._createTargetPoll(type, by, targetId);
   }
 
   /** Votación sobre un usuario concreto: el padrón es su canal de voz, sin él ni bots. */
-  async _createTargetPoll(type, by, targetId) {
+  async _createTargetPoll(type, by, targetId, watchId = null) {
     const vs = this.ctx.discord.getVoiceState(targetId);
     if (!vs?.channelId) return { ok: false, code: 'TARGET_NOT_IN_VOICE' };
     const members = await this._membersOf([vs.channelId]);
     if (!members) return { ok: false, code: 'INTERNAL' };
+    // La duración se propone según la racha ACTUAL; la definitiva se calcula al aprobarse.
+    const proposed = type === POLL_TYPES.START_WATCH ? this.watches.peek(targetId) : null;
     return this.voting.create({
       type,
       requesterId: by,
       targetId,
+      watchId,
       channelIds: [vs.channelId],
       members,
       exclude: [targetId],
+      proposedSeconds: proposed?.durationSeconds,
+      proposedCount: proposed?.count,
     });
   }
 
@@ -388,8 +410,7 @@ class PoliciaService {
   requestFloor({ userId }) {
     return this.lock.run(async () => {
       const { state, discord } = this.ctx;
-      if (!state.patrol) return { ok: false, code: 'NO_PATROL' };
-      const w = state.patrol.watched[userId];
+      const w = this.ctx.watched(userId);
       if (!w) return { ok: false, code: 'NOT_WATCHED_SELF' };
       const vs = discord.getVoiceState(userId);
       if (!vs?.channelId) return { ok: false, code: 'NOT_IN_VOICE' };
@@ -403,6 +424,7 @@ class PoliciaService {
         type: POLL_TYPES.SPEAK_PERMISSION,
         requesterId: userId,
         targetId: userId,
+        watchId: w.id,
         channelIds: [vs.channelId],
         members,
         exclude: [userId],
@@ -448,7 +470,7 @@ class PoliciaService {
     const cancel = (reason) => this.voting.close(poll, messages.pollCancelled(poll, reason));
 
     const w = this.ctx.watched(poll.targetId);
-    if (!state.patrol || state.patrol.id !== poll.patrolId || !w) return cancel('la patrulla o la vigilancia ya no está vigente');
+    if (!w || (poll.watchId && w.id !== poll.watchId)) return cancel('la vigilancia ya no está vigente');
     const vs = discord.getVoiceState(poll.targetId);
     if (!vs?.channelId || vs.channelId !== poll.channelId) return cancel('el solicitante ya no está en el canal de la votación');
 
@@ -462,60 +484,38 @@ class PoliciaService {
   }
 
   /**
-   * Ejecuta una acción administrativa aprobada. Antes de actuar se revalida que las
-   * condiciones sigan vigentes (la votación pudo tardar) y se cierra la votación: así la
-   * acción (p. ej. finalizar, que cancela todas las votaciones) no cancela la que la aprobó.
+   * Ejecuta una acción administrativa aprobada. Antes de actuar se revalida que las condiciones
+   * sigan vigentes (la votación pudo tardar) y se cierra la votación para que la acción no la cancele.
    */
   async _approveAdmin(poll) {
-    const { state, discord } = this.ctx;
+    const { discord } = this.ctx;
     const cancel = (reason) => this.voting.close(poll, messages.pollCancelled(poll, reason));
-    const patrol = state.patrol;
+    const current = this.ctx.watched(poll.targetId);
     const inChannel = () => discord.getVoiceState(poll.targetId)?.channelId === poll.channelId;
 
     switch (poll.type) {
-      case POLL_TYPES.START_PATROL:
-        if (patrol) return cancel('ya hay una patrulla activa');
+      case POLL_TYPES.START_WATCH:
+        if (current) return cancel('el usuario ya está vigilado');
         if (!inChannel()) return cancel('el usuario afectado ya no está en el canal de la votación');
         break;
-      case POLL_TYPES.ADD_WATCH:
-        if (!patrol || patrol.id !== poll.patrolId) return cancel('la patrulla ya no está vigente');
-        if (patrol.watched[poll.targetId]) return cancel('el usuario ya está vigilado');
+      case POLL_TYPES.END_WATCH:
+        if (!current || (poll.watchId && current.id !== poll.watchId)) return cancel('la vigilancia ya no está vigente');
         if (!inChannel()) return cancel('el usuario afectado ya no está en el canal de la votación');
-        break;
-      case POLL_TYPES.REMOVE_WATCH:
-        if (!patrol || patrol.id !== poll.patrolId) return cancel('la patrulla ya no está vigente');
-        if (!patrol.watched[poll.targetId]) return cancel('el usuario ya no está vigilado');
-        if (!inChannel()) return cancel('el usuario afectado ya no está en el canal de la votación');
-        break;
-      case POLL_TYPES.END_PATROL:
-        if (!patrol || patrol.id !== poll.patrolId) return cancel('la patrulla ya no está vigente');
         break;
       default:
         return cancel('tipo de votación desconocido');
     }
 
     await this.voting.close(poll); // deja de estar abierta antes de ejecutar la acción
-    const by = poll.requesterId;
-    const target = messages.user(poll.targetId ?? '');
+    const target = messages.user(poll.targetId);
     let res;
     let outcome;
-    switch (poll.type) {
-      case POLL_TYPES.START_PATROL:
-        res = await this._startPatrol({ by, targetId: poll.targetId });
-        outcome = res.ok && `Patrulla iniciada: ${target} queda vigilado — ${messages.describeMute(res.mute)}.`;
-        break;
-      case POLL_TYPES.ADD_WATCH:
-        res = await this._watch({ by, targetId: poll.targetId });
-        outcome = res.ok && `${target} se incorpora a la patrulla — ${messages.describeMute(res.mute)}.`;
-        break;
-      case POLL_TYPES.REMOVE_WATCH:
-        res = await this._unwatch({ by, targetId: poll.targetId });
-        outcome = res.ok && `${target} deja de estar vigilado.`;
-        break;
-      case POLL_TYPES.END_PATROL:
-        res = await this._finalize({ by });
-        outcome = res.ok && 'Patrulla finalizada: el bot deja de vigilar a todos.';
-        break;
+    if (poll.type === POLL_TYPES.START_WATCH) {
+      res = await this._startWatch({ by: poll.requesterId, targetId: poll.targetId, pollId: poll.id });
+      outcome = res.ok && `${target} queda vigilado — ${messages.describeMute(res.mute)}. ${messages.punishmentOutcome(poll, res.watch)}`;
+    } else {
+      res = await this._endWatchEarly({ by: poll.requesterId, targetId: poll.targetId });
+      outcome = res.ok && `${target} deja de estar vigilado (fin anticipado del castigo).`;
     }
     const text = res.ok ? messages.adminApproved(poll, outcome) : messages.pollCancelled(poll, `no se pudo ejecutar (${res.code})`);
     await this.ctx.safeEdit(poll.messageChannelId, poll.messageId, text);
@@ -529,7 +529,7 @@ class PoliciaService {
     this.permits.clearTimer(permit.userId);
     await this.ctx.save();
     await this.ctx.safeEdit(permit.messageChannelId, permit.messageId, messages.permitExpired(permit));
-    if (state.patrol?.watched[permit.userId]) {
+    if (this.ctx.watched(permit.userId)) {
       const res = await this.mute.ensureMuted(permit.userId);
       if (res.status === 'error') {
         await this.ctx.announce(messages.remuteFailed(permit.userId, res.error));
@@ -561,9 +561,16 @@ class PoliciaService {
       if (!this.mute.consume(userId, newMute) && (w || hasPending)) await this.mute.onExternalTransition(userId, newMute);
     }
 
-    // Si el usuario afectado sale o cambia de canal, el padrón de sus votaciones (palabra,
-    // iniciar/vigilar/dejar de vigilar) deja de ser válido; también se cancela su permiso.
-    // Esto aplica aunque todavía no esté vigilado (START_PATROL / ADD_WATCH).
+    // Una vigilancia vencida (el temporizador aún no corrió) se regulariza antes de cualquier otra cosa:
+    // así una reconexión posterior al vencimiento nunca cuenta ni silencia.
+    if (w && w.expiresAt <= this.ctx.now()) {
+      await this._expireWatch(w.id);
+      return;
+    }
+
+    // Si el usuario afectado sale o cambia de canal, el padrón de sus votaciones (palabra, inicio o fin
+    // anticipado de vigilancia) deja de ser válido; también se cancela su permiso. Esto aplica aunque
+    // todavía no esté vigilado (START_WATCH).
     if (moved || left) {
       const polls = this.voting.cancelWhere((p) => p.targetId === userId);
       const permits = this.permits.cancelWhere((p) => p.userId === userId);
@@ -574,6 +581,18 @@ class PoliciaService {
     }
 
     if (w) {
+      // Reconexiones: solo cuentan los ciclos COMPLETOS salida -> regreso. Cambiar de canal, mutear o
+      // ensordecer no son salidas; un evento repetido no suma porque `awaitingReturn` es un indicador.
+      if (left && !w.awaitingReturn) {
+        w.awaitingReturn = true;
+        await this.ctx.save();
+      } else if (joined && w.awaitingReturn) {
+        w.awaitingReturn = false;
+        w.reconnects += 1;
+        await this.ctx.save();
+        const limit = this.ctx.config.isolationReconnectLimit;
+        if (limit > 0 && w.reconnects >= limit && (await this._tryIsolation(w))) return;
+      }
       if (joined || moved) await this.mute.ensureMuted(userId, { joined });
     } else if (joined && hasPending) {
       await this.mute.tryRelease(userId);
@@ -585,7 +604,36 @@ class PoliciaService {
   getStatus() {
     return this.lock.run(async () => {
       const { state, discord } = this.ctx;
-      const patrol = state.patrol;
+      const watches = this.watches
+        .all()
+        .sort((a, b) => a.expiresAt - b.expiresAt)
+        .map((w) => {
+          const vs = discord.getVoiceState(w.userId);
+          const permit = state.permits[w.userId] ?? null;
+          const poll = this.voting.openPollOf(w.userId);
+          return {
+            id: w.id,
+            userId: w.userId,
+            startedAt: w.startedAt,
+            expiresAt: w.expiresAt,
+            durationSeconds: w.durationSeconds,
+            streakCount: w.streakCount,
+            reconnects: w.reconnects,
+            awaitingReturn: w.awaitingReturn,
+            isolationFailure: w.isolationFailure,
+            inVoice: !!vs?.channelId,
+            channelId: vs?.channelId ?? null,
+            channelName: vs?.channelId ? discord.getChannelName(vs.channelId) : null,
+            serverMute: vs?.channelId ? vs.serverMute === true : null,
+            preMuted: w.preMuted,
+            botMuted: w.botMuted,
+            manualUnmute: w.manualUnmute,
+            uncertain: w.uncertain,
+            needsRemute: w.needsRemute,
+            permitExpiresAt: permit?.expiresAt ?? null,
+            pollId: poll?.id ?? null,
+          };
+        });
       const polls = this.voting.open().map((p) => ({
         id: p.id,
         type: p.type,
@@ -598,36 +646,15 @@ class PoliciaService {
         no: Object.values(p.votes).filter((v) => v === 'no').length,
         createdAt: p.createdAt,
       }));
-      const base = {
-        active: !!patrol,
-        lastPatrol: state.lastPatrol,
+      return {
+        watches,
         polls,
+        permits: this.permits.all().map((p) => ({ userId: p.userId, expiresAt: p.expiresAt })),
+        streak: { ...state.streak },
+        isolations: this.watches.activeIsolations().map((i) => ({ userId: i.userId, until: i.until })),
+        isolationReconnectLimit: this.ctx.config.isolationReconnectLimit ?? 0,
         pendingReleases: Object.entries(state.pendingReleases).map(([userId, p]) => ({ userId, since: p.since })),
       };
-      if (!patrol) return base;
-
-      const watched = Object.values(patrol.watched).map((w) => {
-        const vs = discord.getVoiceState(w.userId);
-        const permit = state.permits[w.userId] ?? null;
-        const poll = this.voting.openPollOf(w.userId);
-        return {
-          userId: w.userId,
-          addedAt: w.addedAt,
-          inVoice: !!vs?.channelId,
-          channelId: vs?.channelId ?? null,
-          channelName: vs?.channelId ? discord.getChannelName(vs.channelId) : null,
-          serverMute: vs?.channelId ? vs.serverMute === true : null,
-          preMuted: w.preMuted,
-          botMuted: w.botMuted,
-          manualUnmute: w.manualUnmute,
-          uncertain: w.uncertain,
-          needsRemute: w.needsRemute,
-          permitExpiresAt: permit?.expiresAt ?? null,
-          pollId: poll?.id ?? null,
-        };
-      });
-      const permits = this.permits.all().map((p) => ({ userId: p.userId, expiresAt: p.expiresAt }));
-      return { ...base, patrol: { id: patrol.id, startedAt: patrol.startedAt, startedBy: patrol.startedBy }, watched, permits };
     });
   }
 }

@@ -13,16 +13,16 @@ async function withPermit() {
   const h = await createHarness();
   await h.discord.join('req', 'v1');
   await h.discord.join('a', 'v1');
-  await h.service.applyStartPatrol({ by: 'mod', targetId: 'req' });
+  await h.service.applyWatch({ by: 'mod', targetId: 'req' });
   const r = await h.service.requestFloor({ userId: 'req' });
   await h.discord.vote(r.poll.messageId, 'a');
   return { h, msg: r.poll.messageId };
 }
 
-test('recupera la patrulla, los vigilados y re-silencia a los conectados', async () => {
+test('recupera las vigilancias activas y re-silencia a los conectados', async () => {
   const h = await createHarness();
   await h.discord.join('u1', 'v1');
-  await h.service.applyStartPatrol({ by: 'mod', targetId: 'u1' });
+  await h.service.applyWatch({ by: 'mod', targetId: 'u1' });
   await h.service.applyWatch({ by: 'mod', targetId: 'u2' }); // desconectado
 
   // durante el reinicio, u2 entró y el mute de u1 se perdió
@@ -32,9 +32,7 @@ test('recupera la patrulla, los vigilados y re-silencia a los conectados', async
   await h.restart();
   await h.service.recover();
   const st = await h.service.getStatus();
-  assert.equal(st.active, true);
-  assert.equal(st.patrol.startedBy, 'mod');
-  assert.deepEqual(st.watched.map((w) => w.userId).sort(), ['u1', 'u2']);
+  assert.deepEqual(st.watches.map((w) => w.userId).sort(), ['u1', 'u2']);
   assert.equal(h.discord.getVoiceState('u1').serverMute, true);
   assert.equal(h.discord.getVoiceState('u2').serverMute, true);
 });
@@ -72,7 +70,7 @@ test('permiso cuyo titular cambió de canal con el bot apagado: se cancela', asy
   await h.restart();
   await h.service.recover();
   assert.deepEqual(h.store.snapshot().permits, {});
-  assert.equal(h.clock.timers.length, 0);
+  assert.equal(h.clock.timers.length, 1, 'solo el temporizador de la vigilancia');
   assert.equal(h.discord.getVoiceState('req').serverMute, true, 'vigilado en el canal nuevo: se vuelve a silenciar');
 });
 
@@ -80,7 +78,7 @@ test('votaciones interrumpidas por un reinicio se cancelan y se comunica', async
   const h = await createHarness();
   await h.discord.join('req', 'v1');
   for (const v of ['a', 'b', 'c']) await h.discord.join(v, 'v1');
-  await h.service.applyStartPatrol({ by: 'mod', targetId: 'req' });
+  await h.service.applyWatch({ by: 'mod', targetId: 'req' });
   const r = await h.service.requestFloor({ userId: 'req' });
   await h.discord.vote(r.poll.messageId, 'a', false); // sigue abierta (3 votantes, 2 necesarios)
   assert.equal(Object.keys(h.store.snapshot().polls).length, 1);
@@ -94,31 +92,31 @@ test('votaciones interrumpidas por un reinicio se cancelan y se comunica', async
   assert.equal((await h.service.requestFloor({ userId: 'req' })).ok, true);
 });
 
-test('una patrulla finalizada no se reactiva tras reiniciar', async () => {
+test('una vigilancia terminada no se reactiva tras reiniciar', async () => {
   const h = await createHarness();
   await h.discord.join('u1', 'v1');
-  await h.service.applyStartPatrol({ by: 'mod', targetId: 'u1' });
-  await h.service.applyFinalize({ by: 'mod' });
+  await h.service.applyWatch({ by: 'mod', targetId: 'u1' });
+  await h.service.applyUnwatch({ by: 'mod', targetId: 'u1' });
 
   await h.restart();
   await h.service.recover();
-  assert.equal((await h.service.getStatus()).active, false);
+  assert.deepEqual((await h.service.getStatus()).watches, []);
   const calls = h.discord.muteCalls.length;
   await h.discord.leave('u1');
   await h.discord.join('u1', 'v2');
   assert.equal(h.discord.muteCalls.length, calls);
-  assert.equal(h.discord.sent.at(-1).content.includes('se reinició'), false, 'sin patrulla no hay aviso de recuperación');
+  assert.equal(h.discord.sent.at(-1).content.includes('se reinició'), false, 'sin vigilancias ni votaciones no hay aviso de recuperación');
 });
 
-test('finalización interrumpida: la patrulla ya figura finalizada y los mutes propios se liberan al reiniciar', async () => {
+test('cierre interrumpido: la vigilancia ya figura terminada y el mute propio se libera al reiniciar', async () => {
   const { DiscordOpError } = require('../src/core/errors');
   const h = await createHarness();
   await h.discord.join('u1', 'v1');
-  await h.service.applyStartPatrol({ by: 'mod', targetId: 'u1' });
+  await h.service.applyWatch({ by: 'mod', targetId: 'u1' });
   h.discord.failMute = new DiscordOpError('UNKNOWN', 'el proceso murió aquí'); // la liberación no llega a ejecutarse
-  await h.service.applyFinalize({ by: 'mod' });
+  await h.service.applyUnwatch({ by: 'mod', targetId: 'u1' });
   const saved = h.store.snapshot();
-  assert.equal(saved.patrol, null);
+  assert.deepEqual(saved.watches, {});
   assert.ok(saved.pendingReleases.u1);
 
   h.discord.failMute = null;
@@ -130,26 +128,23 @@ test('finalización interrumpida: la patrulla ya figura finalizada y los mutes p
 
 test('operación de mute a medias (corte tras persistir la intención): se resuelve observando el estado real', async () => {
   const state = emptyState();
-  state.patrol = {
-    id: 'p',
-    guildId: 'G',
-    startedAt: 1,
-    startedBy: 'mod',
-    watched: {
-      muted: { userId: 'muted', addedAt: 1, addedBy: 'mod', preMuted: false, botMuted: false, pendingOp: 'mute' },
-      notApplied: { userId: 'notApplied', addedAt: 1, addedBy: 'mod', preMuted: false, botMuted: false, pendingOp: 'mute' },
-      offline: { userId: 'offline', addedAt: 1, addedBy: 'mod', preMuted: false, botMuted: false, pendingOp: 'mute' },
-    },
-  };
+  const future = 1_700_000_000_000 + 3_600_000;
+  const mk = (userId) => ({
+    id: `w-${userId}`, userId, status: 'active', requestedBy: 'mod', pollId: null,
+    startedAt: 1_700_000_000_000, expiresAt: future, durationSeconds: 3600, streakCount: 1,
+    reconnects: 0, awaitingReturn: false, isolationAttempted: false, isolationFailure: null,
+    preMuted: false, botMuted: false, pendingOp: 'mute', manualUnmute: false, uncertain: false, needsRemute: false, remuteAttempts: 0,
+  });
+  for (const id of ['muted', 'notApplied', 'offline']) state.watches[`w-${id}`] = mk(id);
   const h = await createHarness({ store: new MemoryStore(state) });
   h.discord.voice.set('muted', { channelId: 'v1', serverMute: true }); // el mute sí se aplicó
   h.discord.voice.set('notApplied', { channelId: 'v1', serverMute: false }); // no llegó a aplicarse
   await h.service.recover();
-  const w = h.store.snapshot().patrol.watched;
-  assert.deepEqual([w.muted.botMuted, w.muted.pendingOp], [true, null]);
-  assert.deepEqual([w.notApplied.botMuted, w.notApplied.pendingOp], [true, null], 're-aplicado');
+  const w = (id) => h.snapWatch(id);
+  assert.deepEqual([w('muted').botMuted, w('muted').pendingOp], [true, null]);
+  assert.deepEqual([w('notApplied').botMuted, w('notApplied').pendingOp], [true, null], 're-aplicado');
   assert.equal(h.discord.getVoiceState('notApplied').serverMute, true);
-  assert.deepEqual([w.offline.botMuted, w.offline.uncertain, w.offline.pendingOp], [false, true, null]);
+  assert.deepEqual([w('offline').botMuted, w('offline').uncertain, w('offline').pendingOp], [false, true, null]);
 });
 
 test('JsonStore: guarda y recupera el estado entre procesos y toma un lock', async () => {
@@ -158,7 +153,7 @@ test('JsonStore: guarda y recupera el estado entre procesos y toma un lock', asy
     const a = new JsonStore(dir);
     a.acquireLock();
     const state = emptyState();
-    state.patrol = { id: 'p1', guildId: 'G', startedAt: 5, startedBy: 'mod', watched: {} };
+    state.streak = { lastUserId: 'x', count: 3 };
     await a.save(state);
     assert.equal(fs.existsSync(path.join(dir, 'state.json.tmp')), false, 'no quedan temporales');
 
@@ -166,7 +161,7 @@ test('JsonStore: guarda y recupera el estado entre procesos y toma un lock', asy
     fs.writeFileSync(path.join(dir, 'bot.lock'), String(process.ppid));
     const b = new JsonStore(dir);
     assert.throws(() => b.acquireLock(), /otra instancia/);
-    assert.equal((await b.load()).patrol.id, 'p1');
+    assert.deepEqual((await b.load()).streak, { lastUserId: 'x', count: 3 });
 
     fs.rmSync(path.join(dir, 'bot.lock'));
     b.acquireLock(); // ahora sí
@@ -199,13 +194,13 @@ test('el servicio funciona de punta a punta sobre JsonStore real (reinicio inclu
   try {
     const h = await createHarness({ store: new JsonStore(dir) });
     await h.discord.join('u1', 'v1');
-    await h.service.applyStartPatrol({ by: 'mod', targetId: 'u1' });
+    await h.service.applyWatch({ by: 'mod', targetId: 'u1' });
     await h.restart();
     await h.service.recover();
     const st = await h.service.getStatus();
-    assert.equal(st.active, true);
-    assert.equal(st.watched[0].userId, 'u1');
-    assert.equal(st.watched[0].serverMute, true);
+    assert.equal(st.watches.length, 1);
+    assert.equal(st.watches[0].userId, 'u1');
+    assert.equal(st.watches[0].serverMute, true);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

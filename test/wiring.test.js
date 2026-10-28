@@ -23,7 +23,7 @@ function fakeService() {
     onVoiceStateUpdate: rec('voice'),
     onReactionChange: rec('reaction'),
     onMessageDeleted: rec('deleted'),
-    requestStartPatrol: async (a) => (calls.push(['start', a]), { ok: true, poll: { roster: ['x'] } }),
+    requestWatch: async (a) => (calls.push(['start', a]), { ok: true, poll: { roster: ['x'] } }),
   };
 }
 
@@ -61,10 +61,10 @@ test('un slash command se difiere, se ejecuta y responde de forma efímera', asy
   const log = [];
   const interaction = {
     isChatInputCommand: () => true,
-    commandName: 'policia-iniciar',
+    commandName: 'vigilar',
     guildId: 'G',
     user: { id: 'mod' },
-    memberPermissions: new PermissionsBitField([PermissionFlagsBits.ManageGuild]),
+    memberPermissions: new PermissionsBitField([PermissionFlagsBits.MuteMembers]),
     options: {
       getUser: () => ({ id: 'u1', bot: false }),
       getMember: () => ({ id: 'u1' }),
@@ -77,21 +77,21 @@ test('un slash command se difiere, se ejecuta y responde de forma efímera', asy
   await tick();
   await tick();
   assert.deepEqual(log[0], ['defer', { flags: MessageFlags.Ephemeral }]);
-  assert.match(log[1][1].content, /Votación para iniciar la patrulla/);
+  assert.match(log[1][1].content, /Votación para vigilar/);
   assert.deepEqual(service.calls[0], ['start', { by: 'mod', targetId: 'u1', targetIsBot: false }]);
 });
 
 test('un error interno responde un mensaje genérico (sin filtrar detalles)', async () => {
   const client = new EventEmitter();
-  const service = { requestStartPatrol: async () => { throw new Error('detalle interno secreto'); } };
+  const service = { requestWatch: async () => { throw new Error('detalle interno secreto'); } };
   registerHandlers({ client, service, config, logger });
   const log = [];
   client.emit(Events.InteractionCreate, {
     isChatInputCommand: () => true,
-    commandName: 'policia-iniciar',
+    commandName: 'vigilar',
     guildId: 'G',
     user: { id: 'mod' },
-    memberPermissions: new PermissionsBitField([PermissionFlagsBits.ManageGuild]),
+    memberPermissions: new PermissionsBitField([PermissionFlagsBits.MuteMembers]),
     options: { getUser: () => ({ id: 'u1', bot: false }), getMember: () => ({}) },
     deferReply: async () => {},
     editReply: async (o) => log.push(o),
